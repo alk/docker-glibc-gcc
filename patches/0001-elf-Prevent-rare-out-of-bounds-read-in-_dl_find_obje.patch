@@ -1,0 +1,103 @@
+From aa72efd7e61fa4891fdcb45276767d0821579951 Mon Sep 17 00:00:00 2001
+From: Aliaksei Kandratsenka <alkondratenko@gmail.com>
+Date: Tue, 6 Oct 2026 10:27:00 -0400
+Subject: [PATCH 1/4] elf: Prevent rare out-of-bounds read in _dl_find_object
+
+There is a small race window between checking that a segment may
+contain the PC being looked up (pc >= seg->objects[0].map_start) and
+bisecting that segment in _dlfo_lookup.  A concurrent dlopen can
+rewrite the segment in between.  Then the "impossible" case of
+first == first1 can occur, and _dlfo_lookup reads seg->objects[-1].
+Explicitly checking for this case just before that access fixes the
+issue.  The lookup then fails the version check and is retried.
+
+With glibc malloc the issue is harmless: the invalid read hits the
+malloc chunk header, and the bogus data is later rejected by the
+version check.  But the segments are allocated with the global-scope
+malloc, which can be interposed (e.g. by tcmalloc).  With such a
+malloc the memory just before the segment may belong to another
+object or be unmapped, so the read can crash.
+
+Signed-off-by: Aliaksei Kandratsenka <alkondratenko@gmail.com>
+---
+ elf/dl-find_object.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/elf/dl-find_object.c b/elf/dl-find_object.c
+index eebd32ee31..8cade2b64e 100644
+--- a/elf/dl-find_object.c
++++ b/elf/dl-find_object.c
+@@ -318,60 +318,70 @@ _dlfo_mappings_active_segment (uint64_t start_version)
+ static inline struct dl_find_object_internal *
+ _dlfo_lookup (uintptr_t pc, struct dl_find_object_internal *first1, size_t size)
+ {
+   struct dl_find_object_internal *end = first1 + size;
+ 
+   /* Search for a lower bound in first.  */
+   struct dl_find_object_internal *first = first1;
+   while (size > 0)
+     {
+       size_t half = size >> 1;
+       struct dl_find_object_internal *middle = first + half;
+       if (atomic_load_relaxed (&middle->map_start) < pc)
+         {
+           first = middle + 1;
+           size -= half + 1;
+         }
+       else
+         size = half;
+     }
+ 
+   if (first != end && pc == atomic_load_relaxed (&first->map_start))
+     {
+       if (pc < atomic_load_relaxed (&first->map_end))
+         return first;
+       else
+         /* Zero-length mapping after dlclose.  */
+         return NULL;
+     }
+   else
+     {
++      /* _dlfo_lookup is invoked after finding that pc is at or after
++	 first1->map_start.  And we come here with first pointing at
++	 the first entry that starts after pc (map_start == pc is
++	 checked above).  So it may seem that first == first1 is
++	 impossible, but note that the segment could be updated
++	 between the first check in _dl_find_object and the bisection
++	 here.  So we need to check for this case to prevent a
++	 possible read outside of the segment.  */
++      if (first == first1)
++	return NULL;
+       /* Check to see if PC is in the previous mapping.  */
+       --first;
+       if (pc < atomic_load_relaxed (&first->map_end))
+         /* pc >= first->map_start implied by the search above.  */
+         return first;
+       else
+         return NULL;
+     }
+ }
+ 
+ int
+ _dl_find_object (void *pc1, struct dl_find_object *result)
+ {
+   uintptr_t pc = (uintptr_t) pc1;
+ 
+   if (__glibc_unlikely (_dlfo_main.map_end == 0))
+     {
+       /* Not initialized.  No locking is needed here because this can
+          only be called from audit modules, which cannot create
+          threads.  */
+       return _dl_find_object_slow (pc1, result);
+     }
+ 
+   /* Main executable.  */
+   if (pc >= _dlfo_main.map_start && pc < _dlfo_main.map_end)
+     {
+       _dl_find_object_to_external (&_dlfo_main, result);
+       return 0;
+     }
+ 
+-- 
+2.55.0
+

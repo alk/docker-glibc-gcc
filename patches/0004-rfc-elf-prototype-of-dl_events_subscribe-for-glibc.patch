@@ -1,0 +1,3446 @@
+From 74fbbba89407bef89224f70b7da0b719bb7832ee Mon Sep 17 00:00:00 2001
+From: Aliaksei Kandratsenka <alkondratenko@gmail.com>
+Date: Sun, 18 Oct 2026 17:47:06 -0400
+Subject: [PATCH 4/4] rfc:elf: prototype of dl_events_subscribe for glibc
+
+See https://tinyurl.com/dl-events-subscribe-design for the API design
+doc.
+
+Note, this is work-in-progress/RFC. No tests are added yet and
+documentation has not been updated.
+
+Here are the glibc-specific details of the prototype implementation.
+We hook into the same update points that are currently used by
+_dl_find_object, and the actual dl_events_subscribe implementation
+lives in the same file (dl-find_object.c). The implementation is
+mostly straightforward. We keep a linked list of all subscriptions
+and a per-module list of the subscriptions tied to that module. The
+new _dl_find_object_pre_dlclose call is where a module's
+subscriptions are dropped. The mutation ban (callbacks may not call
+dlopen, dlclose or dl_events_subscribe) is implemented with the
+dl_mutations_forbidden flag, protected by dl_load_lock. The existing
+_dl_find_object_update and _dl_find_object_dlclose calls are where
+subscription callbacks are invoked.
+
+There is also a new _dl_find_object_note_dl_fini call, invoked from
+_dl_fini, that drops existing subscriptions and disables all future
+ones.
+
+Signed-off-by: Aliaksei Kandratsenka <alkondratenko@gmail.com>
+---
+ elf/Makefile                                  |   1 +
+ elf/Versions                                  |   3 +
+ elf/dl-close.c                                |  10 +
+ elf/dl-find_object.c                          | 192 ++++++++++++++++++
+ elf/dl-find_object.h                          |  16 ++
+ elf/dl-fini.c                                 |   5 +
+ elf/dl-open.c                                 |   7 +
+ elf/dl-support.c                              |   2 +
+ elf/libc-dl_events_subscribe.c                |  29 +++
+ elf/link.h                                    |  73 +++++++
+ elf/rtld.c                                    |   1 +
+ elf/rtld_static_init.c                        |   3 +
+ include/link.h                                |   9 +
+ sysdeps/generic/ldsodefs.h                    |  10 +
+ sysdeps/mach/hurd/i386/libc.abilist           |   1 +
+ sysdeps/mach/hurd/x86_64/libc.abilist         |   1 +
+ sysdeps/unix/sysv/linux/aarch64/libc.abilist  |   1 +
+ sysdeps/unix/sysv/linux/alpha/libc.abilist    |   1 +
+ sysdeps/unix/sysv/linux/arc/libc.abilist      |   1 +
+ sysdeps/unix/sysv/linux/arm/be/libc.abilist   |   1 +
+ sysdeps/unix/sysv/linux/arm/le/libc.abilist   |   1 +
+ sysdeps/unix/sysv/linux/csky/libc.abilist     |   1 +
+ sysdeps/unix/sysv/linux/hppa/libc.abilist     |   1 +
+ sysdeps/unix/sysv/linux/i386/libc.abilist     |   1 +
+ .../sysv/linux/loongarch/ilp32/libc.abilist   |   1 +
+ .../sysv/linux/loongarch/lp64/libc.abilist    |   1 +
+ .../sysv/linux/m68k/coldfire/libc.abilist     |   1 +
+ .../unix/sysv/linux/m68k/m680x0/libc.abilist  |   1 +
+ .../sysv/linux/microblaze/be/libc.abilist     |   1 +
+ .../sysv/linux/microblaze/le/libc.abilist     |   1 +
+ .../sysv/linux/mips/mips32/fpu/libc.abilist   |   1 +
+ .../sysv/linux/mips/mips32/nofpu/libc.abilist |   1 +
+ .../sysv/linux/mips/mips64/n32/libc.abilist   |   1 +
+ .../sysv/linux/mips/mips64/n64/libc.abilist   |   1 +
+ sysdeps/unix/sysv/linux/or1k/libc.abilist     |   1 +
+ .../linux/powerpc/powerpc32/fpu/libc.abilist  |   1 +
+ .../powerpc/powerpc32/nofpu/libc.abilist      |   1 +
+ .../linux/powerpc/powerpc64/be/libc.abilist   |   1 +
+ .../linux/powerpc/powerpc64/le/libc.abilist   |   1 +
+ .../unix/sysv/linux/riscv/rv32/libc.abilist   |   1 +
+ .../unix/sysv/linux/riscv/rv64/libc.abilist   |   1 +
+ sysdeps/unix/sysv/linux/s390/libc.abilist     |   1 +
+ sysdeps/unix/sysv/linux/sh/be/libc.abilist    |   1 +
+ sysdeps/unix/sysv/linux/sh/le/libc.abilist    |   1 +
+ .../sysv/linux/sparc/sparc32/libc.abilist     |   1 +
+ .../sysv/linux/sparc/sparc64/libc.abilist     |   1 +
+ .../unix/sysv/linux/x86_64/64/libc.abilist    |   1 +
+ .../unix/sysv/linux/x86_64/x32/libc.abilist   |   1 +
+ 48 files changed, 395 insertions(+)
+ create mode 100644 elf/libc-dl_events_subscribe.c
+
+diff --git a/elf/Makefile b/elf/Makefile
+index 79321d6a91..61554d04d8 100644
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -16,60 +16,61 @@
+ # <https://www.gnu.org/licenses/>.
+ 
+ # Makefile for elf subdirectory of GNU C Library.
+ 
+ subdir		:= elf
+ 
+ include ../Makeconfig
+ 
+ headers = \
+   bits/elfclass.h \
+   bits/link.h \
+   bits/link_lavcurrent.h \
+   elf.h \
+   link.h \
+   # headers
+ 
+ routines = \
+   $(all-dl-routines) \
+   dl-addr \
+   dl-addr-obj \
+   dl-early_allocate \
+   dl-iteratephdr \
+   dl-libc \
+   dl-origin \
+   dl-reloc-static-pie \
+   dl-support \
+   dl-sym \
+   dl-sysdep \
+   enbl-secure \
+   libc-dl-profstub  \
++  libc-dl_events_subscribe \
+   libc-dl_find_object \
+   libc_early_init \
+   rtld_static_init \
+   # routines
+ 
+ # The core dynamic linking functions are in libc for the static and
+ # profiled libraries.
+ dl-routines = \
+   dl-call-libc-early-init \
+   dl-call_fini \
+   dl-catch \
+   dl-close \
+   dl-debug \
+   dl-debug-symbols \
+   dl-debug_state \
+   dl-deps \
+   dl-exception \
+   dl-execstack \
+   dl-execstack-tunable \
+   dl-find_object \
+   dl-fini \
+   dl-init \
+   dl-load \
+   dl-lookup \
+   dl-lookup-direct \
+   dl-minimal-malloc \
+   dl-misc \
+   dl-object \
+   dl-open \
+   dl-origin \
+diff --git a/elf/Versions b/elf/Versions
+index 1591031da9..4dbcd94f4d 100644
+--- a/elf/Versions
++++ b/elf/Versions
+@@ -1,55 +1,58 @@
+ libc {
+   GLIBC_2.0 {
+ %ifdef EXPORT_UNWIND_FIND_FDE
+     __deregister_frame_info; __register_frame_info;
+ %endif
+   }
+   GLIBC_2.1 {
+     # functions used in other libraries
+     _dl_mcount_wrapper; _dl_mcount_wrapper_check;
+   }
+   GLIBC_2.2.4 {
+     dl_iterate_phdr;
+   }
+ %ifdef EXPORT_UNWIND_FIND_FDE
+   # Needed for SHLIB_COMPAT calls using this version.
+   GLIBC_2.2.5 {
+   }
+   GCC_3.0 {
+     __deregister_frame_info_bases; __register_frame_info_bases;
+     __register_frame_info_table_bases; _Unwind_Find_FDE;
+   }
+ %endif
+   GLIBC_2.35 {
+     _dl_find_object;
+   }
++  GLIBC_2.45 {
++    dl_events_subscribe;
++  }
+   GLIBC_ABI_DT_RELR {
+     # This symbol is used only for empty version map and will be removed
+     # by scripts/versions.awk.
+     __placeholder_only_for_empty_version_map;
+   }
+   GLIBC_PRIVATE {
+     # functions used in other libraries
+     __libc_early_init;
+   }
+ }
+ 
+ ld {
+   GLIBC_2.0 {
+     _r_debug;
+   }
+   GLIBC_2.1 {
+     # functions used in other libraries
+     _dl_mcount;
+     # historically used by Garbage Collectors
+     __libc_stack_end;
+   }
+   GLIBC_2.3 {
+     # runtime interface to TLS
+     __tls_get_addr;
+   }
+   GLIBC_2.4 {
+     # stack canary
+     __stack_chk_guard;
+   }
+   GLIBC_2.34 {
+diff --git a/elf/dl-close.c b/elf/dl-close.c
+index 39e1cf89ff..72706f95fd 100644
+--- a/elf/dl-close.c
++++ b/elf/dl-close.c
+@@ -235,60 +235,62 @@ _dl_close_worker (struct link_map *map, bool force)
+ 		  {
+ 		    jmap->l_map_used = 1;
+ 		    if (jmap->l_idx - 1 < done_index)
+ 		      done_index = jmap->l_idx - 1;
+ 		  }
+ 	      }
+ 	  }
+     }
+ 
+   /* Sort the entries.  Unless retrying, the maps[0] object (the
+      original argument to dlclose) needs to remain first, so that its
+      destructor runs first.  */
+   _dl_sort_maps (maps, nloaded, /* force_first */ map != NULL, true);
+ 
+   /* Call all termination functions at once.  */
+   bool unload_any = false;
+   bool scope_mem_left = false;
+   unsigned int unload_global = 0;
+   unsigned int first_loaded = ~0;
+   for (unsigned int i = 0; i < nloaded; ++i)
+     {
+       struct link_map *imap = maps[i];
+ 
+       /* All elements must be in the same namespace.  */
+       assert (imap->l_ns == nsid);
+ 
+       if (!imap->l_map_used)
+ 	{
+ 	  assert (imap->l_type == lt_loaded && !imap->l_nodelete_active);
+ 
++	  _dl_find_object_pre_dlclose (imap);
++
+ 	  /* Call its termination function.  Do not do it for
+ 	     half-cooked objects.  Temporarily disable exception
+ 	     handling, so that errors are fatal.  */
+ 	  if (imap->l_init_called)
+ 	    _dl_catch_exception (NULL, _dl_call_fini, imap);
+ 
+ #ifdef SHARED
+ 	  /* Auditing checkpoint: we will start deleting objects.
+ 	     This is supposed to happen before la_objclose (see _dl_fini),
+ 	     but only once per non-recursive dlclose call.  */
+ 	  if (!unload_any)
+ 	    _dl_audit_activity_nsid (nsid, LA_ACT_DELETE);
+ 
+ 	  /* Auditing checkpoint: we remove an object.  */
+ 	  _dl_audit_objclose (imap);
+ #endif
+ 
+ 	  /* This object must not be used anymore.  */
+ 	  imap->l_removed = 1;
+ 
+ 	  /* We indeed have an object to remove.  */
+ 	  unload_any = true;
+ 
+ 	  if (imap->l_global)
+ 	    ++unload_global;
+ 
+ 	  /* Remember where the first dynamically loaded object is.  */
+ 	  if (i < first_loaded)
+ 	    first_loaded = i;
+ 	}
+@@ -747,60 +749,68 @@ _dl_close_worker (struct link_map *map, bool force)
+ #endif
+ 
+   if (__builtin_expect (ns->_ns_loaded == NULL, 0)
+       && nsid == GL(dl_nns) - 1)
+     do
+       --GL(dl_nns);
+     while (GL(dl_ns)[GL(dl_nns) - 1]._ns_loaded == NULL);
+ 
+   /* Recheck if we need to retry, release the lock.  */
+  out:
+   if (dl_close_state == rerun)
+     {
+       /* The map may have been deallocated.  */
+       map = NULL;
+       goto retry;
+     }
+ 
+   dl_close_state = not_pending;
+ }
+ 
+ 
+ void
+ _dl_close (void *_map)
+ {
+   struct link_map *map = _map;
+ 
+   /* We must take the lock to examine the contents of map and avoid
+      concurrent dlopens.  */
+   __rtld_lock_lock_recursive (GL(dl_load_lock));
+ 
++  if (GL(dl_mutations_forbidden))
++    {
++      __rtld_lock_unlock_recursive (GL(dl_load_lock));
++      _dl_signal_error (0, map->l_name, NULL,
++			N_("dlclose call from "
++			   "dl_events_subscribe callback is forbidden"));
++    }
++
+   /* At this point we are guaranteed nobody else is touching the list of
+      loaded maps, but a concurrent dlclose might have freed our map
+      before we took the lock. There is no way to detect this (see below)
+      so we proceed assuming this isn't the case.  First see whether we
+      can remove the object at all.  */
+   if (__glibc_unlikely (map->l_nodelete_active))
+     {
+       /* Nope.  Do nothing.  */
+       __rtld_lock_unlock_recursive (GL(dl_load_lock));
+       return;
+     }
+ 
+   /* At present this is an unreliable check except in the case where the
+      caller has recursively called dlclose and we are sure the link map
+      has not been freed.  In a non-recursive dlclose the map itself
+      might have been freed and this access is potentially a data race
+      with whatever other use this memory might have now, or worse we
+      might silently corrupt memory if it looks enough like a link map.
+      POSIX has language in dlclose that appears to guarantee that this
+      should be a detectable case and given that dlclose should be threadsafe
+      we need this to be a reliable detection.
+      This is bug 20990. */
+   if (__builtin_expect (map->l_direct_opencount, 1) == 0)
+     {
+       __rtld_lock_unlock_recursive (GL(dl_load_lock));
+       _dl_signal_error (0, map->l_name, NULL, N_("shared object not open"));
+     }
+ 
+   _dl_close_worker (map, false);
+ 
+diff --git a/elf/dl-find_object.c b/elf/dl-find_object.c
+index 8cade2b64e..12be252480 100644
+--- a/elf/dl-find_object.c
++++ b/elf/dl-find_object.c
+@@ -1,59 +1,61 @@
+ /* Locating objects in the process image.  ld.so implementation.
+    Copyright (C) 2021-2026 Free Software Foundation, Inc.
+    This file is part of the GNU C Library.
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+ 
+    The GNU C Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+ 
+    You should have received a copy of the GNU Lesser General Public
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <assert.h>
+ #include <atomic.h>
+ #include <atomic_wide_counter.h>
+ #include <dl-find_object.h>
+ #include <dlfcn.h>
+ #include <ldsodefs.h>
+ #include <link.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++static void run_events_callbacks_locked (struct link_map *dso, int is_unload);
++
+ /* Fallback implementation of _dl_find_object.  It uses a linear
+    search, needs locking, and is not async-signal-safe.  It is used in
+    _dl_find_object prior to initialization, when called from audit
+    modules.  It also serves as the reference implementation for
+    _dl_find_object.  */
+ static int
+ _dl_find_object_slow (void *pc, struct dl_find_object *result)
+ {
+   ElfW(Addr) addr = (ElfW(Addr)) pc;
+   for (Lmid_t ns = 0; ns < GL(dl_nns); ++ns)
+     for (struct link_map *l = GL(dl_ns)[ns]._ns_loaded; l != NULL;
+          l = l->l_next)
+       if (addr >= l->l_map_start && addr < l->l_map_end
+           && (l->l_contiguous || _dl_addr_inside_object (l, addr)))
+         {
+           assert (ns == l->l_ns);
+           struct dl_find_object_internal internal;
+           _dl_find_object_from_map (l, &internal);
+           _dl_find_object_to_external (&internal, result);
+           return 0;
+         }
+ 
+   /* Object not found.  */
+   return -1;
+ }
+ 
+ /* Data for the main executable.  There is usually a large gap between
+    the main executable and initially loaded shared objects.  Record
+    the main executable separately, to increase the chance that the
+    range for the non-closeable mappings below covers only the shared
+@@ -810,82 +812,272 @@ _dl_find_object_update_1 (struct link_map **loaded, size_t count)
+   if (target_seg->previous != NULL)
+     atomic_store_relaxed (&target_seg->previous->size, 0);
+ 
+   _dlfo_mappings_end_update ();
+   return true;
+ }
+ 
+ bool
+ _dl_find_object_update (struct link_map *new_map)
+ {
+   /* Copy the newly-loaded link maps into an array for sorting.  */
+   size_t count = 0;
+   for (struct link_map *l = new_map; l != NULL; l = l->l_next)
+     /* Skip proxy maps and already-processed maps.  */
+     count += l == l->l_real && !l->l_find_object_processed;
+   if (count == 0)
+     return true;
+ 
+   struct link_map **map_array = malloc (count * sizeof (*map_array));
+   if (map_array == NULL)
+     return false;
+   {
+     size_t i = 0;
+     for (struct link_map *l = new_map; l != NULL; l = l->l_next)
+       if (l == l->l_real && !l->l_find_object_processed)
+         map_array[i++] = l;
+   }
+ 
+   _dl_find_object_link_map_sort (map_array, count);
+   bool ok = _dl_find_object_update_1 (map_array, count);
++  if (ok)
++    /* Now that the maps are marked as processed, report them to
++       dl_events_subscribe callbacks.  */
++    for (size_t i = 0; i < count; ++i)
++      run_events_callbacks_locked (map_array[i], /*is_unload=*/ 0);
+   free (map_array);
+   return ok;
+ }
+ 
+ void
+ _dl_find_object_dlclose (struct link_map *map)
+ {
+   uint64_t start_version = _dlfo_read_version_locked ();
+   uintptr_t map_start = map->l_map_start;
+ 
++  run_events_callbacks_locked (map, /*is_unload=*/ 1);
+ 
+   /* Directly patch the size information in the mapping to mark it as
+      unused.  See the parallel lookup logic in _dl_find_object.  Do
+      not check for previous dlclose at the same mapping address
+      because that cannot happen (there would have to be an
+      intermediate dlopen, which drops size-zero mappings).  */
+   for (struct dlfo_mappings_segment *seg
+          = _dlfo_mappings_active_segment (start_version);
+        seg != NULL && seg->size > 0; seg = seg->previous)
+     if (map_start >= seg->objects[0].map_start)
+       {
+         struct dl_find_object_internal *obj
+           = _dlfo_lookup (map_start, seg->objects, seg->size);
+         if (obj == NULL)
+           /* Ignore missing link maps because of potential shutdown
+              issues around __libc_freeres.  */
+             return;
+ 
+         /* Mark as closed.  This does not change the overall data
+            structure, so no TM cycle is needed.  */
+         atomic_store_relaxed (&obj->map_end, obj->map_start);
+         atomic_store_relaxed (&obj->map, NULL);
+         return;
+       }
+ }
+ 
+ void
+ _dl_find_object_freeres (void)
+ {
+   for (int idx = 0; idx < 2; ++idx)
+     {
+       for (struct dlfo_mappings_segment *seg = _dlfo_loaded_mappings[idx];
+            seg != NULL; )
+         {
+           struct dlfo_mappings_segment *previous = seg->previous;
+           free (seg->to_free);
+           seg = previous;
+         }
+       /* Stop searching in shared objects.  */
+       _dlfo_loaded_mappings[idx] = NULL;
+     }
+ }
++
++struct dl_events_subscription
++  {
++    struct dl_events_subscription *next;
++    struct dl_events_subscription **pprev;
++    struct dl_events_subscription *next_same_obj;
++    void (*callback) (struct dl_phdr_info *, size_t, void *, int is_unload);
++    void *callback_data;
++  };
++
++static struct dl_events_subscription *event_callbacks;
++
++/* Set to true at the start of _dl_fini to disable dl_events_subscribe facility. */
++static bool event_callbacks_terminated;
++
++void
++_dl_find_object_note_dl_fini (void)
++{
++  __rtld_lock_lock_recursive (GL(dl_load_lock));
++  event_callbacks_terminated = true;
++
++  for (Lmid_t ns = 0; ns < GL(dl_nns); ++ns)
++    for (struct link_map *l = GL(dl_ns)[ns]._ns_loaded; l != NULL; l = l->l_next)
++      l->l_events_subscriptions = NULL;
++
++  while (event_callbacks)
++    {
++      struct dl_events_subscription *cur = event_callbacks;
++      event_callbacks = cur->next;
++      free (cur);
++    }
++
++  __rtld_lock_unlock_recursive (GL(dl_load_lock));
++}
++
++static void
++fill_phdr_info (struct link_map *l, struct dl_phdr_info *info)
++{
++  /* fill_phdr_info is never invoked for proxy objects */
++  assert (l == l->l_real);
++
++  info->dlpi_addr = l->l_addr;
++  info->dlpi_name = l->l_name;
++  info->dlpi_phdr = l->l_phdr;
++  info->dlpi_phnum = l->l_phnum;
++  info->dlpi_adds = 0;
++  info->dlpi_subs = 0;
++  info->dlpi_tls_data = NULL;
++  info->dlpi_tls_modid = l->l_tls_modid;
++  if (info->dlpi_tls_modid != 0)
++    info->dlpi_tls_data = GLRO(dl_tls_get_addr_soft) (l);
++}
++
++int
++_dl_events_subscribe (void (*callback) (struct dl_phdr_info *, size_t,
++					void *, int is_unload),
++		      void *callback_data)
++{
++  /* Errors are reported as return values rather than via
++     _dl_signal_error, so that this can be called directly from a
++     libc.so loaded into a statically linked program (which has its
++     own exception handling and dlerror state).  */
++  struct dl_events_subscription *handle = malloc (sizeof (*handle));
++  if (handle == NULL)
++    return ENOMEM;
++
++  *handle = (struct dl_events_subscription){0};
++
++  /* The subscription is tied to the module containing the callback.
++     DL_LOOKUP_ADDRESS translates function descriptors (e.g. on hppa)
++     to code addresses.  */
++  ElfW(Addr) callback_addr = DL_LOOKUP_ADDRESS (callback);
++
++  __rtld_lock_lock_recursive (GL(dl_load_lock));
++
++  if (GL(dl_mutations_forbidden))
++    {
++      __rtld_lock_unlock_recursive (GL(dl_load_lock));
++      free (handle);
++      return EDEADLK;
++    }
++
++  struct link_map *match = _dl_find_dso_for_object (callback_addr);
++
++  if (event_callbacks_terminated
++      || (match != NULL && match->l_events_unsubscribed))
++    {
++      /* Either process exit has started and all subscriptions have
++	 been canceled, or the module containing the callback is being
++	 unloaded by dlclose and its subscriptions have already been
++	 canceled (e.g. we are called from its destructor).  Do not
++	 install the subscription, as nothing would cancel it, but
++	 still report the currently loaded modules below.  */
++      free (handle);
++    }
++  else
++    {
++      struct dl_events_subscription *old = event_callbacks;
++      handle->callback = callback;
++      handle->callback_data = callback_data;
++
++      handle->next = old;
++      handle->pprev = &event_callbacks;
++      if (old)
++	old->pprev = &handle->next;
++      event_callbacks = handle;
++
++      if (match)
++	{
++	  handle->next_same_obj = match->l_events_subscriptions;
++	  match->l_events_subscriptions = handle;
++	}
++    }
++
++  GL(dl_mutations_forbidden) = true;
++  for (Lmid_t ns = 0 ; ns < GL(dl_nns); ++ns)
++    for (struct link_map *l = GL(dl_ns)[ns]._ns_loaded; l != NULL; l = l->l_next)
++      {
++	/* See run_events_callbacks_locked for why unprocessed maps are
++	   skipped.  If loading succeeds, they will be reported by
++	   _dl_find_object_update.  */
++	if (l != l->l_real || !l->l_find_object_processed)
++	  continue;
++	struct dl_phdr_info info;
++	fill_phdr_info (l, &info);
++	callback (&info, sizeof (info), callback_data, /*is_unload=*/ 0);
++      }
++  GL(dl_mutations_forbidden) = false;
++
++  __rtld_lock_unlock_recursive (GL(dl_load_lock));
++  return 0;
++}
++
++void
++_dl_find_object_pre_dlclose (struct link_map *map)
++{
++  struct dl_events_subscription *cur = map->l_events_subscriptions;
++  map->l_events_subscriptions = NULL;
++  map->l_events_unsubscribed = 1;
++  while (cur)
++    {
++      struct dl_events_subscription *h = cur;
++      struct dl_events_subscription *next = h->next;
++      cur = cur->next_same_obj;
++
++      if (next)
++        next->pprev = h->pprev;
++
++      *(h->pprev) = next;
++      free (h);
++    }
++}
++
++static void
++run_events_callbacks_locked (struct link_map *dso, int is_unload)
++{
++  struct dl_events_subscription *cur;
++
++  /* Only report maps that have been processed by _dl_find_object.
++     A map that failed to load before reaching _dl_find_object_update
++     may not have been fully set up (e.g. its TLS module ID is
++     assigned, but not yet registered in the slotinfo list, which
++     makes _dl_tls_get_addr_soft unsafe).  Such maps have not been
++     reported as loaded either.  */
++  if (dso != dso->l_real || !dso->l_find_object_processed)
++    return;
++
++  if (event_callbacks == NULL)
++    return;
++
++  assert (!GL(dl_mutations_forbidden));
++  GL(dl_mutations_forbidden) = true;
++
++
++  for (cur = event_callbacks; cur; cur = cur->next)
++    {
++      struct dl_phdr_info info;
++      fill_phdr_info (dso, &info);
++      cur->callback (&info, sizeof (info), cur->callback_data,
++		     is_unload);
++    }
++
++  GL(dl_mutations_forbidden) = false;
++}
+diff --git a/elf/dl-find_object.h b/elf/dl-find_object.h
+index 70027c3e9e..89f67a0be6 100644
+--- a/elf/dl-find_object.h
++++ b/elf/dl-find_object.h
+@@ -137,34 +137,50 @@ _dl_find_object_from_map (struct link_map *l,
+                                 (void *) (ph->p_vaddr + l->l_addr));
+           read_seg |= 2;
+ 	  [[fallthrough]];
+         default:
+           break;
+         }
+       if (read_seg == 3)
+         goto done;
+    }
+ 
+  done:
+   l->l_find_object_processed = 1;
+ }
+ 
+ /* Called by the dynamic linker to set up the data structures for the
+    initially loaded objects.  This creates a few persistent
+    allocations, so it should be called with the minimal malloc.  */
+ void _dl_find_object_init (void) attribute_hidden;
+ 
+ /* Called by dlopen/dlmopen to add new objects to the DWARF EH frame
+    data structures.  NEW_MAP is the dlopen'ed link map.  Link maps on
+    the l_next list are added if l_object_processed is 0.  Needs to
+    be protected by loader load lock.  Returns true on success, false
+    on malloc failure.  */
+ bool _dl_find_object_update (struct link_map *new_map) attribute_hidden;
+ 
+ /* Called by dlclose to remove the link map from the DWARF EH frame
+    data structures.  Needs to be protected by loader load lock.  */
+ void _dl_find_object_dlclose (struct link_map *l) attribute_hidden;
+ 
++/* Called by dlclose before any object finalizers are run. Used to
++   deactivate object's dl_events_subscribe callbacks and to prevent
++   new subscriptions from being installed for it. */
++void _dl_find_object_pre_dlclose (struct link_map *l) attribute_hidden;
++
++/* Called by _dl_fini. Disables all dl_events_subscribe
++   subscriptions. Invoked without loader locks.  */
++void _dl_find_object_note_dl_fini (void) attribute_hidden;
++
+ /* Called from __libc_freeres to deallocate malloc'ed memory.  */
+ void _dl_find_object_freeres (void) attribute_hidden;
+ 
++/* Implementation of dl_events_subscribe.  The subscription is tied to
++   the module containing CALLBACK.  Returns 0 on success or an error
++   number.  */
++int _dl_events_subscribe (void (*__callback) (struct dl_phdr_info *, size_t,
++					      void *, int is_unload),
++			  void *__data) attribute_hidden;
++
+ #endif /* _DL_FIND_OBJECT_H */
+diff --git a/elf/dl-fini.c b/elf/dl-fini.c
+index ff8d5adf48..84086b99e1 100644
+--- a/elf/dl-fini.c
++++ b/elf/dl-fini.c
+@@ -1,56 +1,61 @@
+ /* Call the termination functions of loaded shared objects.
+    Copyright (C) 1995-2026 Free Software Foundation, Inc.
+    This file is part of the GNU C Library.
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+ 
+    The GNU C Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+ 
+    You should have received a copy of the GNU Lesser General Public
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <assert.h>
+ #include <string.h>
+ #include <ldsodefs.h>
+ #include <elf-initfini.h>
+ 
++#include "dl-find_object.h"
++
+ void
+ _dl_fini (void)
+ {
++  /* Mass-cancel all dl_events_subscribe subscriptions first. */
++  _dl_find_object_note_dl_fini ();
++
+   /* Lots of fun ahead.  We have to call the destructors for all still
+      loaded objects, in all namespaces.  The problem is that the ELF
+      specification now demands that dependencies between the modules
+      are taken into account.  I.e., the destructor for a module is
+      called before the ones for any of its dependencies.
+ 
+      To make things more complicated, we cannot simply use the reverse
+      order of the constructors.  Since the user might have loaded objects
+      using `dlopen' there are possibly several other modules with its
+      dependencies to be taken into account.  Therefore we have to start
+      determining the order of the modules once again from the beginning.  */
+ 
+   /* We run the destructors of the main namespaces last.  As for the
+      other namespaces, we pick run the destructors in them in reverse
+      order of the namespace ID.  */
+ #ifdef SHARED
+   int do_audit = 0;
+  again:
+ #endif
+   for (Lmid_t ns = GL(dl_nns) - 1; ns >= 0; --ns)
+     {
+       /* Protect against concurrent loads and unloads.  */
+       __rtld_lock_lock_recursive (GL(dl_load_lock));
+ 
+       unsigned int nloaded = GL(dl_ns)[ns]._ns_nloaded;
+       /* No need to do anything for empty namespaces or those used for
+ 	 auditing DSOs.  */
+       if (nloaded == 0
+ #ifdef SHARED
+ 	  || GL(dl_ns)[ns]._ns_loaded->l_auditing != do_audit
+diff --git a/elf/dl-open.c b/elf/dl-open.c
+index 21d589b12e..fd62f16447 100644
+--- a/elf/dl-open.c
++++ b/elf/dl-open.c
+@@ -772,60 +772,67 @@ dl_open_worker (void *a)
+     }
+ 
+   maybe_report_r_debug_consistent (args);
+ 
+   /* Run the initializer functions of new objects.  Temporarily
+      disable the exception handler, so that lazy binding failures are
+      fatal.  */
+   _dl_catch_exception (NULL, call_dl_init, args);
+ 
+   /* Now we can make the new map available in the global scope.  */
+   if (mode & RTLD_GLOBAL)
+     add_to_global_update (new);
+ 
+   /* Let the user know about the opencount.  */
+   if (__glibc_unlikely (GLRO(dl_debug_mask) & DL_DEBUG_FILES))
+     _dl_debug_printf ("opening file=%s [%lu]; direct_opencount=%u\n\n",
+ 		      new->l_name, new->l_ns, new->l_direct_opencount);
+ }
+ 
+ void *
+ _dl_open (const char *file, int mode, const void *caller_dlopen, Lmid_t nsid,
+ 	  int argc, char *argv[], char *env[])
+ {
+   if ((mode & RTLD_BINDING_MASK) == 0)
+     /* One of the flags must be set.  */
+     _dl_signal_error (EINVAL, file, NULL, N_("invalid mode for dlopen()"));
+ 
+   /* Make sure we are alone.  */
+   __rtld_lock_lock_recursive (GL(dl_load_lock));
+ 
++  if (GL(dl_mutations_forbidden))
++    {
++      __rtld_lock_unlock_recursive (GL(dl_load_lock));
++      _dl_signal_error (0, file, NULL, N_("dlopen call from dl_events_subscribe"
++					  " callback is forbidden"));
++    }
++
+   if (__glibc_unlikely (nsid == LM_ID_NEWLM))
+     {
+       /* Find a new namespace.  */
+       for (nsid = 1; DL_NNS > 1 && nsid < GL(dl_nns); ++nsid)
+ 	if (GL(dl_ns)[nsid]._ns_loaded == NULL)
+ 	  break;
+ 
+       if (__glibc_unlikely (nsid == DL_NNS))
+ 	{
+ 	  /* No more namespace available.  */
+ 	  __rtld_lock_unlock_recursive (GL(dl_load_lock));
+ 
+ 	  _dl_signal_error (EINVAL, file, NULL, N_("\
+ no more namespaces available for dlmopen()"));
+ 	}
+       else if (nsid == GL(dl_nns))
+ 	{
+ 	  __rtld_lock_initialize (GL(dl_ns)[nsid]._ns_unique_sym_table.lock);
+ 	  ++GL(dl_nns);
+ 	}
+ 
+       GL(dl_ns)[nsid].libc_map = NULL;
+       _dl_debug_change_state (_dl_debug_update (nsid), RT_CONSISTENT);
+     }
+   /* Never allow loading a DSO in a namespace which is empty.  Such
+      direct placements is only causing problems.  Also don't allow
+      loading into a namespace used for auditing.  */
+   else if (__glibc_unlikely (nsid != LM_ID_BASE && nsid != __LM_ID_CALLER)
+ 	   && (__glibc_unlikely (nsid < 0 || nsid >= GL(dl_nns))
+ 	       /* This prevents the [NSID] index expressions from being
+diff --git a/elf/dl-support.c b/elf/dl-support.c
+index b57fd74670..5978b02625 100644
+--- a/elf/dl-support.c
++++ b/elf/dl-support.c
+@@ -86,60 +86,62 @@ static struct link_map _dl_main_map =
+     .l_libname = &(struct libname_list) { .name = "", .dont_free = 1 },
+     .l_searchlist =
+       {
+ 	.r_list = &(struct link_map *) { &_dl_main_map },
+ 	.r_nlist = 1,
+       },
+     .l_symbolic_searchlist = { .r_list = &(struct link_map *) { NULL } },
+     .l_type = lt_executable,
+     .l_scope_mem = { &_dl_main_map.l_searchlist },
+     .l_scope_max = (sizeof (_dl_main_map.l_scope_mem)
+ 		    / sizeof (_dl_main_map.l_scope_mem[0])),
+     .l_scope = _dl_main_map.l_scope_mem,
+     .l_local_scope = { &_dl_main_map.l_searchlist },
+     .l_used = 1,
+     .l_tls_offset = NO_TLS_OFFSET,
+     .l_serial = 1,
+   };
+ 
+ /* Namespace information.  */
+ struct link_namespaces _dl_ns[DL_NNS] =
+   {
+     [LM_ID_BASE] =
+       {
+ 	._ns_loaded = &_dl_main_map,
+ 	._ns_nloaded = 1,
+ 	._ns_main_searchlist = &_dl_main_map.l_searchlist,
+       }
+   };
+ size_t _dl_nns = 1;
+ 
++bool _dl_mutations_forbidden;
++
+ /* Incremented whenever something may have been added to dl_loaded. */
+ unsigned long long _dl_load_adds = 1;
+ 
+ /* Fake scope of the main application.  */
+ struct r_scope_elem _dl_initial_searchlist =
+   {
+     .r_list = &(struct link_map *) { &_dl_main_map },
+     .r_nlist = 1,
+   };
+ 
+ #ifndef HAVE_INLINED_SYSCALLS
+ /* Nonzero during startup.  */
+ int _dl_starting_up = 1;
+ #endif
+ 
+ /* Random data provided by the kernel.  */
+ void *_dl_random;
+ 
+ /* Get architecture specific initializer.  */
+ #include <dl-procruntime.c>
+ #include <dl-procinfo.c>
+ 
+ size_t _dl_pagesize = EXEC_PAGESIZE;
+ 
+ size_t _dl_minsigstacksize = CONSTANT_MINSIGSTKSZ;
+ 
+ int _dl_inhibit_cache;
+ 
+ /* All known directories in sorted order.  */
+ struct r_search_path_elem *_dl_all_dirs;
+diff --git a/elf/libc-dl_events_subscribe.c b/elf/libc-dl_events_subscribe.c
+new file mode 100644
+index 0000000000..a2cf25bb4d
+--- /dev/null
++++ b/elf/libc-dl_events_subscribe.c
+@@ -0,0 +1,29 @@
++/* Subscription to module load and unload events.  libc forwarder.
++   Copyright (C) 2026 Free Software Foundation, Inc.
++   This file is part of the GNU C Library.
++
++   The GNU C Library is free software; you can redistribute it and/or
++   modify it under the terms of the GNU Lesser General Public
++   License as published by the Free Software Foundation; either
++   version 2.1 of the License, or (at your option) any later version.
++
++   The GNU C Library is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++   Lesser General Public License for more details.
++
++   You should have received a copy of the GNU Lesser General Public
++   License along with the GNU C Library; if not, see
++   <https://www.gnu.org/licenses/>.  */
++
++#include <dl-find_object.h>
++#include <ldsodefs.h>
++#include <link.h>
++
++int
++dl_events_subscribe (void (*__callback) (struct dl_phdr_info *, size_t,
++					 void *, int is_unload),
++		     void *__data)
++{
++  return GLRO (dl_events_subscribe) (__callback, __data);
++}
+diff --git a/elf/link.h b/elf/link.h
+index 8a06075113..cf8688a0da 100644
+--- a/elf/link.h
++++ b/elf/link.h
+@@ -158,54 +158,127 @@ struct dl_phdr_info
+     const char *dlpi_name;
+     const ElfW(Phdr) *dlpi_phdr;
+     ElfW(Half) dlpi_phnum;
+ 
+     /* Note: Following members were introduced after the first
+        version of this structure was available.  Check the SIZE
+        argument passed to the dl_iterate_phdr callback to determine
+        whether or not each later member is available.  */
+ 
+     /* Incremented when a new object may have been added.  */
+     __extension__ unsigned long long int dlpi_adds;
+     /* Incremented when an object may have been removed.  */
+     __extension__ unsigned long long int dlpi_subs;
+ 
+     /* If there is a PT_TLS segment, its module ID as used in
+        TLS relocations, else zero.  */
+     size_t dlpi_tls_modid;
+ 
+     /* The address of the calling thread's instance of this module's
+        PT_TLS segment, if it has one and it has been allocated
+        in the calling thread, otherwise a null pointer.  */
+     void *dlpi_tls_data;
+   };
+ 
+ __BEGIN_DECLS
+ 
+ extern int dl_iterate_phdr (int (*__callback) (struct dl_phdr_info *,
+ 					       size_t, void *),
+ 			    void *__data);
+ 
++/* dl_events_subscribe installs a subscription for module load and
++   unload events.  The C library invokes __CALLBACK with a struct
++   dl_phdr_info, as dl_iterate_phdr does, except that dlpi_adds and
++   dlpi_subs are set to 0.  __IS_UNLOAD is 1 for unload events and 0
++   for load events.  The dl_phdr_info data is valid only for the
++   duration of the callback.
++
++   __CALLBACK may be invoked with internal dynamic linker locks held.
++   It must not call functions that load or unload modules (such as
++   dlopen, dlclose or dl_events_subscribe), or anything that may call
++   them indirectly (e.g. iconv or NSS functions); such calls fail.  It
++   must also not wait for other threads that may be performing such
++   operations.  __CALLBACK must return normally; it must not exit via
++   longjmp or by throwing an exception.
++
++   Callback invocations are not guaranteed to be serialized: different
++   threads may invoke callbacks for different events concurrently, so
++   there is no single global order of events.  It is only guaranteed
++   that:
++
++   a) dl_events_subscribe invokes __CALLBACK for all currently loaded
++      modules before it returns;
++
++   b) dlopen invokes all registered callbacks for each newly loaded
++      module before the module's constructors run;
++
++   c) dlclose invokes all registered callbacks for each unloaded
++      module after the destructors of all unloaded modules have run,
++      and before the module is unmapped.
++
++   Unload events may occasionally be reported without a prior load
++   event, and duplicate load events may be reported, but a load event
++   for a module is never reported after its matching unload event.
++   The order in which registered callbacks are invoked for an event is
++   unspecified.  Whether the module being reported is visible to other
++   dynamic linker query interfaces (such as _dl_find_object, dladdr or
++   dl_iterate_phdr) while __CALLBACK runs is also unspecified.
++
++   There is no dl_events_unsubscribe.  A subscription is associated
++   with the module that contains __CALLBACK and is canceled when that
++   module is unloaded by dlclose, before its destructors run; __DATA
++   must remain valid until then.  If __CALLBACK is not part of any
++   module (e.g. generated code), the subscription is only canceled at
++   process exit.  If dl_events_subscribe is called after the
++   unloading of __CALLBACK's module has started (for example, from
++   that module's destructor), __CALLBACK is still invoked for all
++   currently loaded modules, but no subscription is established.
++
++   At process exit, all subscriptions are canceled when the dynamic
++   linker's exit processing starts.  This happens after exit handlers
++   registered from the main program's constructors onwards (including
++   atexit handlers and C++ static destructors of the main program and
++   of dlopen'ed modules), but before any ELF destructors run and
++   before exit handlers registered by the constructors of initially
++   loaded shared objects (such as their C++ static destructors).
++   Callback state must remain valid until then.  No unload events are
++   reported at exit.  Calls made after process exit has started still
++   invoke __CALLBACK for all currently loaded modules, but establish
++   no subscription.  In statically linked programs, subscriptions are
++   not canceled at exit.
++
++   Unlike dl_iterate_phdr, and like _dl_find_object, this interface
++   reports events for all dynamic linker namespaces.
++
++   Returns 0 on success, or an error number on failure (errno is not
++   set): ENOMEM if memory for the subscription could not be
++   allocated, or EDEADLK if called from a dl_events_subscribe
++   callback.  */
++extern int dl_events_subscribe (void (*__callback) (struct dl_phdr_info *__info,
++						    size_t __info_size,
++						    void *__data,
++						    int __is_unload),
++				void *__data);
+ 
+ /* Prototypes for the ld.so auditing interfaces.  These are not
+    defined anywhere in ld.so but instead have to be provided by the
+    auditing DSO.  */
+ extern unsigned int la_version (unsigned int __version);
+ extern void la_activity (uintptr_t *__cookie, unsigned int __flag);
+ extern char *la_objsearch (const char *__name, uintptr_t *__cookie,
+ 			   unsigned int __flag);
+ extern unsigned int la_objopen (struct link_map *__map, Lmid_t __lmid,
+ 				uintptr_t *__cookie);
+ extern void la_preinit (uintptr_t *__cookie);
+ extern uintptr_t la_symbind32 (Elf32_Sym *__sym, unsigned int __ndx,
+ 			       uintptr_t *__refcook, uintptr_t *__defcook,
+ 			       unsigned int *__flags, const char *__symname);
+ extern uintptr_t la_symbind64 (Elf64_Sym *__sym, unsigned int __ndx,
+ 			       uintptr_t *__refcook, uintptr_t *__defcook,
+ 			       unsigned int *__flags, const char *__symname);
+ extern unsigned int la_objclose (uintptr_t *__cookie);
+ 
+ __END_DECLS
+ 
+ #endif
+ 
+ #endif /* link.h */
+diff --git a/elf/rtld.c b/elf/rtld.c
+index 324393d606..c0b4f7da92 100644
+--- a/elf/rtld.c
++++ b/elf/rtld.c
+@@ -427,60 +427,61 @@ extern const ElfW(Ehdr) __ehdr_start attribute_hidden;
+ extern char _end[] attribute_hidden;
+ 
+ 
+ #ifdef RTLD_START
+ RTLD_START
+ #else
+ # error "sysdeps/MACHINE/dl-machine.h fails to define RTLD_START"
+ #endif
+ 
+ /* This is the second half of _dl_start (below).  It can be inlined safely
+    under DONT_USE_BOOTSTRAP_MAP, where it is careful not to make any GOT
+    references.  When the tools don't permit us to avoid using a GOT entry
+    for _dl_rtld_global (no attribute_hidden support), we must make sure
+    this function is not inlined (see below).  */
+ 
+ #ifdef DONT_USE_BOOTSTRAP_MAP
+ static inline ElfW(Addr) __attribute__ ((always_inline))
+ _dl_start_final (void *arg)
+ #else
+ static ElfW(Addr) __attribute__ ((noinline))
+ _dl_start_final (void *arg, struct dl_start_final_info *info)
+ #endif
+ {
+   ElfW(Addr) start_addr;
+ 
+   __rtld_malloc_init_stubs ();
+ 
+   /* Do not use an initializer for these members because it would
+      interfere with __rtld_static_init.  */
+   GLRO (dl_find_object) = &_dl_find_object;
++  GLRO (dl_events_subscribe) = &_dl_events_subscribe;
+   GLRO (dl_readonly_area) = &_dl_readonly_area;
+ 
+   /* If it hasn't happen yet record the startup time.  */
+   rtld_timer_start (&start_time);
+ #if !defined DONT_USE_BOOTSTRAP_MAP
+   RTLD_TIMING_SET (start_time, info->start_time);
+ #endif
+ 
+   /* Transfer data about ourselves to the permanent link_map structure.  */
+ #ifndef DONT_USE_BOOTSTRAP_MAP
+   _dl_rtld_map.l_addr = info->l.l_addr;
+   _dl_rtld_map.l_ld = info->l.l_ld;
+   _dl_rtld_map.l_ld_readonly = info->l.l_ld_readonly;
+   memcpy (_dl_rtld_map.l_info, info->l.l_info, sizeof _dl_rtld_map.l_info);
+   _dl_rtld_map.l_mach = info->l.l_mach;
+   _dl_rtld_map.l_relocated = 1;
+ #endif
+   _dl_setup_hash (&_dl_rtld_map);
+   _dl_rtld_map.l_real = &_dl_rtld_map;
+   _dl_rtld_map.l_map_start
+     = (ElfW(Addr)) DL_ADDRESS_WITHOUT_RELOC (&__ehdr_start);
+   _dl_rtld_map.l_map_end
+     = (ElfW(Addr)) DL_ADDRESS_WITHOUT_RELOC (_end);
+   /* Copy the TLS related data if necessary.  */
+ #ifndef DONT_USE_BOOTSTRAP_MAP
+ # if NO_TLS_OFFSET != 0
+   _dl_rtld_map.l_tls_offset = NO_TLS_OFFSET;
+ # endif
+ #endif
+ 
+diff --git a/elf/rtld_static_init.c b/elf/rtld_static_init.c
+index 959a44beb4..554a93515d 100644
+--- a/elf/rtld_static_init.c
++++ b/elf/rtld_static_init.c
+@@ -1,95 +1,98 @@
+ /* Partial initialization of ld.so loaded via static dlopen.
+    Copyright (C) 2021-2026 Free Software Foundation, Inc.
+    This file is part of the GNU C Library.
+ 
+    The GNU C Library is free software; you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public
+    License as published by the Free Software Foundation; either
+    version 2.1 of the License, or (at your option) any later version.
+ 
+    The GNU C Library is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+    Lesser General Public License for more details.
+ 
+    You should have received a copy of the GNU Lesser General Public
+    License along with the GNU C Library; if not, see
+    <https://www.gnu.org/licenses/>.  */
+ 
+ #include <assert.h>
+ 
+ /* Very special case: This object is built into the static libc, but
+    must know the layout of _rtld_global_ro.  */
+ #define SHARED
+ #include <ldsodefs.h>
+ 
+ #include <rtld_static_init.h>
+ 
++#include "dl-find_object.h"
++
+ static const struct dlfcn_hook _dlfcn_hook =
+   {
+     .dlopen = __dlopen,
+     .dlclose = __dlclose,
+     .dlsym = __dlsym,
+     .dlvsym = __dlvsym,
+     .dlerror = __dlerror,
+     .dladdr = __dladdr,
+     .dladdr1 = __dladdr1,
+     .dlinfo = __dlinfo,
+     .dlmopen = __dlmopen,
+     .libc_dlopen_mode = __libc_dlopen_mode,
+     .libc_dlsym = __libc_dlsym,
+     .libc_dlvsym = __libc_dlvsym,
+     .libc_dlclose = __libc_dlclose,
+   };
+ 
+ void
+ __rtld_static_init (struct link_map *map)
+ {
+   const ElfW(Sym) *sym
+     = _dl_lookup_direct (map, "_rtld_global_ro",
+                          0x9f28436a, /* dl_new_hash output.  */
+                          "GLIBC_PRIVATE",
+                          0x0963cf85); /* _dl_elf_hash output.  */
+   assert (sym != NULL);
+   struct rtld_global_ro *dl = DL_SYMBOL_ADDRESS (map, sym);
+ 
+   /* Perform partial initialization here.  Note that this runs before
+      ld.so is relocated, so only members initialized without
+      relocations can be written here.  */
+ #ifdef HAVE_AUX_VECTOR
+   extern __typeof (dl->_dl_auxv) _dl_auxv attribute_hidden;
+   dl->_dl_auxv = _dl_auxv;
+   extern __typeof (dl->_dl_clktck) _dl_clktck attribute_hidden;
+   dl->_dl_clktck = _dl_clktck;
+ #endif
+   dl->_dl_dlfcn_hook = &_dlfcn_hook;
+   extern __typeof (dl->_dl_hwcap) _dl_hwcap attribute_hidden;
+   dl->_dl_hwcap = _dl_hwcap;
+   extern __typeof (dl->_dl_hwcap2) _dl_hwcap2 attribute_hidden;
+   dl->_dl_hwcap2 = _dl_hwcap2;
+   extern __typeof (dl->_dl_minsigstacksize) _dl_minsigstacksize
+     attribute_hidden;
+   dl->_dl_minsigstacksize = _dl_minsigstacksize;
+   extern __typeof (dl->_dl_pagesize) _dl_pagesize attribute_hidden;
+   dl->_dl_pagesize = _dl_pagesize;
+   extern __typeof (dl->_dl_tls_static_align) _dl_tls_static_align
+     attribute_hidden;
+   dl->_dl_tls_static_align = _dl_tls_static_align;
+   extern __typeof (dl->_dl_tls_static_size) _dl_tls_static_size
+     attribute_hidden;
+   dl->_dl_tls_static_size = _dl_tls_static_size;
+   dl->_dl_find_object = _dl_find_object;
++  dl->_dl_events_subscribe = _dl_events_subscribe;
+   dl->_dl_readonly_area = _dl_readonly_area;
+ 
+   extern uintptr_t __pointer_chk_guard_local attribute_hidden;
+   const ElfW(Sym) *guard_sym
+     = _dl_lookup_direct (map, "__pointer_chk_guard",
+ 			 0x69f99cab, /* _dl_new_hash output.  */
+ 			 "GLIBC_PRIVATE",
+ 			 0x0963cf85); /* _dl_elf_hash output.  */
+   assert (guard_sym != NULL);
+   *(uintptr_t *) DL_SYMBOL_ADDRESS (map, guard_sym)
+     = __pointer_chk_guard_local;
+ 
+   __rtld_static_init_arch (map, dl);
+ }
+diff --git a/include/link.h b/include/link.h
+index e299ca35fd..ab69c936d7 100644
+--- a/include/link.h
++++ b/include/link.h
+@@ -182,60 +182,64 @@ struct link_map
+     unsigned int l_relocated:1;	/* Nonzero if object's relocations done.  */
+     unsigned int l_init_called:1; /* Nonzero if DT_INIT function called.  */
+     unsigned int l_global:1;	/* Nonzero if object in _dl_global_scope.  */
+     unsigned int l_reserved:2;	/* Reserved for internal use.  */
+     unsigned int l_main_map:1;  /* Nonzero for the map of the main program.  */
+     unsigned int l_visited:1;   /* Used internally for map dependency
+ 				   graph traversal.  */
+     unsigned int l_map_used:1;  /* These two bits are used during traversal */
+     unsigned int l_map_done:1;  /* of maps in _dl_close_worker. */
+     unsigned int l_phdr_allocated:1; /* Nonzero if the data structure pointed
+ 					to by `l_phdr' is allocated.  */
+     unsigned int l_soname_added:1; /* Nonzero if the SONAME is for sure in
+ 				      the l_libname list.  */
+     unsigned int l_faked:1;	/* Nonzero if this is a faked descriptor
+ 				   without associated file.  */
+     unsigned int l_auditing:1;	/* Nonzero if the DSO is used in auditing.  */
+     unsigned int l_audit_any_plt:1; /* Nonzero if at least one audit module
+ 				       is interested in the PLT interception.*/
+     unsigned int l_removed:1;	/* Non-zero if the object cannot be used anymore
+ 				   since it is removed.  */
+     unsigned int l_contiguous:1; /* Nonzero if inter-segment holes are
+ 				    mprotected or if no holes are present at
+ 				    all.  */
+     unsigned int l_free_initfini:1; /* Nonzero if l_initfini can be
+ 				       freed, ie. not allocated with
+ 				       the dummy malloc in ld.so.  */
+     unsigned int l_ld_readonly:1; /* Nonzero if dynamic section is readonly.  */
+     unsigned int l_find_object_processed:1; /* Zero if _dl_find_object_update
+ 					       needs to process this
+ 					       lt_library map.  */
++    unsigned int l_events_unsubscribed:1; /* Nonzero once dlclose has
++					     canceled this map's
++					     dl_events_subscribe
++					     subscriptions.  */
+     unsigned int l_tls_in_slotinfo:1; /* TLS slotinfo updated in dlopen.  */
+ 
+     /* NODELETE status of the map.  Only valid for maps of type
+        lt_loaded.  Lazy binding sets l_nodelete_active directly,
+        potentially from signal handlers.  Initial loading of an
+        DF_1_NODELETE object set l_nodelete_pending.  Relocation may
+        set l_nodelete_pending as well.  l_nodelete_pending maps are
+        promoted to l_nodelete_active status in the final stages of
+        dlopen, prior to calling ELF constructors.  dlclose only
+        refuses to unload l_nodelete_active maps, the pending status is
+        ignored.  */
+     bool l_nodelete_active;
+     bool l_nodelete_pending;
+ 
+ #include <link_map.h>
+ 
+     /* Collected information about own RPATH directories.  */
+     struct r_search_path_struct l_rpath_dirs;
+ 
+     /* Collected results of relocation while profiling.  */
+     struct reloc_result
+     {
+       DL_FIXUP_VALUE_TYPE addr;
+       struct link_map *bound;
+       unsigned int boundndx;
+       uint32_t enterexit;
+       unsigned int flags;
+       /* CONCURRENCY NOTE: This is used to guard the concurrent initialization
+ 	 of the relocation result across multiple threads.  See the more
+ 	 detailed notes in elf/dl-runtime.c.  */
+@@ -316,60 +320,65 @@ struct link_map
+     /* Offset of first byte module alignment.  */
+     size_t l_tls_firstbyte_offset;
+ #ifndef NO_TLS_OFFSET
+ # define NO_TLS_OFFSET	0
+ #endif
+ #ifndef FORCED_DYNAMIC_TLS_OFFSET
+ # if NO_TLS_OFFSET == 0
+ #  define FORCED_DYNAMIC_TLS_OFFSET -1
+ # elif NO_TLS_OFFSET == -1
+ #  define FORCED_DYNAMIC_TLS_OFFSET -2
+ # else
+ #  error "FORCED_DYNAMIC_TLS_OFFSET is not defined"
+ # endif
+ #endif
+     /* For objects present at startup time: offset in the static TLS block.  */
+     ptrdiff_t l_tls_offset;
+     /* Index of the module in the dtv array.  */
+     size_t l_tls_modid;
+ 
+     /* Number of thread_local objects constructed by this DSO.  This is
+        atomically accessed and modified and is not always protected by the load
+        lock.  See also: CONCURRENCY NOTES in cxa_thread_atexit_impl.c.  */
+     size_t l_tls_dtor_count;
+ 
+     /* Information used to change permission after the relocations are
+        done.  */
+     ElfW(Addr) l_relro_addr;
+     size_t l_relro_size;
+ 
+     unsigned long long int l_serial;
++
++    /* List (linked via next_same_obj) of the dl_events_subscribe
++       subscriptions tied to this object.  Protected by the load
++       lock.  */
++    struct dl_events_subscription *l_events_subscriptions;
+   };
+ 
+ #include <dl-relocate-ld.h>
+ 
+ /* Information used by audit modules.  For most link maps, this data
+    immediate follows the link map in memory.  For the dynamic linker,
+    it is allocated separately.  See link_map_audit_state in
+    <ldsodefs.h>.  */
+ struct auditstate
+ {
+   uintptr_t cookie;
+   unsigned int bindflags;
+ };
+ 
+ 
+ /* This is the hidden instance of struct r_debug_extended used by the
+    dynamic linker.  */
+ extern struct r_debug_extended _r_debug_extended attribute_hidden;
+ 
+ rtld_hidden_proto (_r_debug)
+ 
+ #if __ELF_NATIVE_CLASS == 32
+ # define symbind symbind32
+ # define LA_SYMBIND "la_symbind32"
+ #elif __ELF_NATIVE_CLASS == 64
+ # define symbind symbind64
+ # define LA_SYMBIND "la_symbind64"
+ #else
+ # error "__ELF_NATIVE_CLASS must be defined"
+ #endif
+diff --git a/sysdeps/generic/ldsodefs.h b/sysdeps/generic/ldsodefs.h
+index 305ca6e0df..8a57661832 100644
+--- a/sysdeps/generic/ldsodefs.h
++++ b/sysdeps/generic/ldsodefs.h
+@@ -353,60 +353,65 @@ struct rtld_global
+ 	const struct link_map *map;
+       } *entries;
+       size_t size;
+       size_t n_elements;
+       void (*free) (void *);
+     } _ns_unique_sym_table;
+   } _dl_ns[DL_NNS];
+   /* One higher than index of last used namespace.  */
+   EXTERN size_t _dl_nns;
+ 
+   /* During the program run we must not modify the global data of
+      loaded shared object simultaneously in two threads.  Therefore we
+      protect `_dl_open' and `_dl_close' in dl-close.c.
+ 
+      This must be a recursive lock since the initializer function of
+      the loaded object might as well require a call to this function.
+      At this time it is not anymore a problem to modify the tables.  */
+   __rtld_lock_define_recursive (EXTERN, _dl_load_lock)
+   /* This lock is used to keep __dl_iterate_phdr from inspecting the
+      list of loaded objects while an object is added to or removed
+      from that list.  */
+   __rtld_lock_define_recursive (EXTERN, _dl_load_write_lock)
+   /* This lock protects global and module specific TLS related data.
+      E.g. it is held in dlopen and dlclose when GL(dl_tls_generation),
+      GL(dl_tls_max_dtv_idx) or GL(dl_tls_dtv_slotinfo_list) are
+      accessed and when TLS related relocations are processed for a
+      module.  It was introduced to keep pthread_create accessing TLS
+      state that is being set up.  */
+   __rtld_lock_define_recursive (EXTERN, _dl_load_tls_lock)
+ 
++  /* Set to true around callbacks of dl_events_subscribe.  Makes
++     dlopen/dlclose family of functions fail.  Accessed under load
++     lock.  */
++  EXTERN bool _dl_mutations_forbidden;
++
+   /* Incremented whenever something may have been added to dl_loaded.  */
+   EXTERN unsigned long long _dl_load_adds;
+ 
+   /* The object to be initialized first.  */
+   EXTERN struct link_map *_dl_initfirst;
+ 
+   /* Map of shared object to be profiled.  */
+   EXTERN struct link_map *_dl_profile_map;
+ 
+   /* Counters for the number of relocations performed.  */
+   EXTERN unsigned long int _dl_num_relocations;
+   EXTERN unsigned long int _dl_num_cache_relocations;
+ 
+   /* List of search directories.  */
+   EXTERN struct r_search_path_elem *_dl_all_dirs;
+ 
+   /* Get architecture specific definitions.  */
+ #define PROCINFO_DECL
+ #ifndef PROCINFO_CLASS
+ # define PROCINFO_CLASS EXTERN
+ #endif
+ #include <dl-procruntime.c>
+ 
+   /* Prevailing state of the stack, PF_X indicating it's executable.  */
+   EXTERN int _dl_stack_prot_flags;
+ 
+   /* Flag signalling whether there are gaps in the module ID allocation.  */
+   EXTERN bool _dl_tls_dtv_gaps;
+   /* Highest dtv index currently needed.  */
+   EXTERN size_t _dl_tls_max_dtv_idx;
+@@ -648,60 +653,65 @@ struct rtld_global_ro
+      PLT relocations in libc.so.  */
+   void (*_dl_debug_printf) (const char *, ...)
+        __attribute__ ((__format__ (__printf__, 1, 2)));
+   void (*_dl_mcount) (ElfW(Addr) frompc, ElfW(Addr) selfpc);
+   lookup_t (*_dl_lookup_symbol_x) (const char *, struct link_map *,
+ 				   const ElfW(Sym) **, struct r_scope_elem *[],
+ 				   const struct r_found_version *, int, int,
+ 				   struct link_map *);
+   void *(*_dl_open) (const char *file, int mode, const void *caller_dlopen,
+ 		     Lmid_t nsid, int argc, char *argv[], char *env[]);
+   void (*_dl_close) (void *map);
+   /* libdl in a secondary namespace (after dlopen) must use
+      _dl_catch_error from the main namespace, so it has to be
+      exported in some way.  */
+   int (*_dl_catch_error) (const char **objname, const char **errstring,
+ 			  bool *mallocedp, void (*operate) (void *),
+ 			  void *args);
+   /* libdl in a secondary namespace must use free from the base
+      namespace.  */
+   void (*_dl_error_free) (void *);
+   void *(*_dl_tls_get_addr_soft) (struct link_map *);
+ 
+   /* Called from __libc_shared to deallocate malloc'ed memory.  */
+   void (*_dl_libc_freeres) (void);
+ 
+   /* Implementation of _dl_find_object.  The public entry point is in
+      libc, and this is patched by __rtld_static_init to support static
+      dlopen.  */
+   int (*_dl_find_object) (void *, struct dl_find_object *);
+ 
++  /* Implementation of _dl_events_subscribe.  */
++  int (*_dl_events_subscribe) (void (*)(struct dl_phdr_info *, size_t,
++					void *, int),
++			       void *);
++
+   /* Implementation of _dl_readonly_area, used in fortify routines to check
+      if memory area is within a read-only ELF segment.  */
+   enum dl_readonly_area_error_type (*_dl_readonly_area) (const void *, size_t);
+ 
+   /* Dynamic linker operations used after static dlopen.  */
+   const struct dlfcn_hook *_dl_dlfcn_hook;
+ 
+   /* List of auditing interfaces.  */
+   struct audit_ifaces *_dl_audit;
+   unsigned int _dl_naudit;
+ };
+ # define __rtld_global_attribute__
+ # if IS_IN (rtld)
+ #  define __rtld_local_attribute__ __attribute__ ((visibility ("hidden")))
+ extern struct rtld_global_ro _rtld_local_ro
+     attribute_relro __rtld_local_attribute__;
+ extern struct rtld_global_ro _rtld_global_ro
+     attribute_relro __rtld_global_attribute__;
+ #  undef __rtld_local_attribute__
+ # else
+ /* We cheat a bit here.  We declare the variable as as const even
+    though it is at startup.  */
+ extern const struct rtld_global_ro _rtld_global_ro
+     attribute_relro __rtld_global_attribute__;
+ # endif
+ # undef __rtld_global_attribute__
+ #endif
+ #undef EXTERN
+ 
+ #ifndef SHARED
+diff --git a/sysdeps/mach/hurd/i386/libc.abilist b/sysdeps/mach/hurd/i386/libc.abilist
+index 9d9dbe0187..39a54ec375 100644
+--- a/sysdeps/mach/hurd/i386/libc.abilist
++++ b/sysdeps/mach/hurd/i386/libc.abilist
+@@ -2808,60 +2808,61 @@ GLIBC_2.44 aio_fsync64 F
+ GLIBC_2.44 aio_init F
+ GLIBC_2.44 aio_read F
+ GLIBC_2.44 aio_read64 F
+ GLIBC_2.44 aio_return F
+ GLIBC_2.44 aio_return64 F
+ GLIBC_2.44 aio_suspend F
+ GLIBC_2.44 aio_suspend64 F
+ GLIBC_2.44 aio_write F
+ GLIBC_2.44 aio_write64 F
+ GLIBC_2.44 gai_cancel F
+ GLIBC_2.44 gai_error F
+ GLIBC_2.44 gai_suspend F
+ GLIBC_2.44 getaddrinfo_a F
+ GLIBC_2.44 lio_listio F
+ GLIBC_2.44 lio_listio64 F
+ GLIBC_2.44 mq_close F
+ GLIBC_2.44 mq_getattr F
+ GLIBC_2.44 mq_notify F
+ GLIBC_2.44 mq_open F
+ GLIBC_2.44 mq_receive F
+ GLIBC_2.44 mq_send F
+ GLIBC_2.44 mq_setattr F
+ GLIBC_2.44 mq_timedreceive F
+ GLIBC_2.44 mq_timedsend F
+ GLIBC_2.44 mq_unlink F
+ GLIBC_2.44 timer_create F
+ GLIBC_2.44 timer_delete F
+ GLIBC_2.44 timer_getoverrun F
+ GLIBC_2.44 timer_gettime F
+ GLIBC_2.44 timer_settime F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+ GLIBC_2.7 __isoc99_scanf F
+ GLIBC_2.7 __isoc99_sscanf F
+ GLIBC_2.7 __isoc99_swscanf F
+ GLIBC_2.7 __isoc99_vfscanf F
+ GLIBC_2.7 __isoc99_vfwscanf F
+ GLIBC_2.7 __isoc99_vscanf F
+diff --git a/sysdeps/mach/hurd/x86_64/libc.abilist b/sysdeps/mach/hurd/x86_64/libc.abilist
+index bbc5dd4d9a..e644627769 100644
+--- a/sysdeps/mach/hurd/x86_64/libc.abilist
++++ b/sysdeps/mach/hurd/x86_64/libc.abilist
+@@ -2484,43 +2484,44 @@ GLIBC_2.44 aio_fsync64 F
+ GLIBC_2.44 aio_init F
+ GLIBC_2.44 aio_read F
+ GLIBC_2.44 aio_read64 F
+ GLIBC_2.44 aio_return F
+ GLIBC_2.44 aio_return64 F
+ GLIBC_2.44 aio_suspend F
+ GLIBC_2.44 aio_suspend64 F
+ GLIBC_2.44 aio_write F
+ GLIBC_2.44 aio_write64 F
+ GLIBC_2.44 gai_cancel F
+ GLIBC_2.44 gai_error F
+ GLIBC_2.44 gai_suspend F
+ GLIBC_2.44 getaddrinfo_a F
+ GLIBC_2.44 lio_listio F
+ GLIBC_2.44 lio_listio64 F
+ GLIBC_2.44 mq_close F
+ GLIBC_2.44 mq_getattr F
+ GLIBC_2.44 mq_notify F
+ GLIBC_2.44 mq_open F
+ GLIBC_2.44 mq_receive F
+ GLIBC_2.44 mq_send F
+ GLIBC_2.44 mq_setattr F
+ GLIBC_2.44 mq_timedreceive F
+ GLIBC_2.44 mq_timedsend F
+ GLIBC_2.44 mq_unlink F
+ GLIBC_2.44 timer_create F
+ GLIBC_2.44 timer_delete F
+ GLIBC_2.44 timer_getoverrun F
+ GLIBC_2.44 timer_gettime F
+ GLIBC_2.44 timer_settime F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ HURD_CTHREADS_0.3 __mutex_init F
+ HURD_CTHREADS_0.3 __mutex_lock F
+ HURD_CTHREADS_0.3 __mutex_trylock F
+ HURD_CTHREADS_0.3 __mutex_unlock F
+ HURD_CTHREADS_0.3 __pthread_detach F
+ HURD_CTHREADS_0.3 __pthread_getattr_np F
+ HURD_CTHREADS_0.3 __spin_lock F
+ HURD_CTHREADS_0.3 __spin_lock_init F
+ HURD_CTHREADS_0.3 __spin_lock_solid F
+ HURD_CTHREADS_0.3 __spin_try_lock F
+ HURD_CTHREADS_0.3 __spin_unlock F
+diff --git a/sysdeps/unix/sysv/linux/aarch64/libc.abilist b/sysdeps/unix/sysv/linux/aarch64/libc.abilist
+index ad0cbaa2ac..97b32a7ec9 100644
+--- a/sysdeps/unix/sysv/linux/aarch64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/aarch64/libc.abilist
+@@ -2748,32 +2748,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/alpha/libc.abilist b/sysdeps/unix/sysv/linux/alpha/libc.abilist
+index 0e75090900..b88c45f705 100644
+--- a/sysdeps/unix/sysv/linux/alpha/libc.abilist
++++ b/sysdeps/unix/sysv/linux/alpha/libc.abilist
+@@ -3095,60 +3095,61 @@ GLIBC_2.4 wcstold F
+ GLIBC_2.4 wcstold_l F
+ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/arc/libc.abilist b/sysdeps/unix/sysv/linux/arc/libc.abilist
+index 2b40d1adec..3afae131d6 100644
+--- a/sysdeps/unix/sysv/linux/arc/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arc/libc.abilist
+@@ -2509,32 +2509,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/arm/be/libc.abilist b/sysdeps/unix/sysv/linux/arm/be/libc.abilist
+index ae7f8787f5..3523a4665a 100644
+--- a/sysdeps/unix/sysv/linux/arm/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arm/be/libc.abilist
+@@ -2801,60 +2801,61 @@ GLIBC_2.4 xdrstdio_create F
+ GLIBC_2.4 xencrypt F
+ GLIBC_2.4 xprt_register F
+ GLIBC_2.4 xprt_unregister F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/arm/le/libc.abilist b/sysdeps/unix/sysv/linux/arm/le/libc.abilist
+index 42a0e9816b..37785527a2 100644
+--- a/sysdeps/unix/sysv/linux/arm/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/arm/le/libc.abilist
+@@ -2798,60 +2798,61 @@ GLIBC_2.4 xdrstdio_create F
+ GLIBC_2.4 xencrypt F
+ GLIBC_2.4 xprt_register F
+ GLIBC_2.4 xprt_unregister F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/csky/libc.abilist b/sysdeps/unix/sysv/linux/csky/libc.abilist
+index 17566797fc..3137eefb1b 100644
+--- a/sysdeps/unix/sysv/linux/csky/libc.abilist
++++ b/sysdeps/unix/sysv/linux/csky/libc.abilist
+@@ -2785,32 +2785,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/hppa/libc.abilist b/sysdeps/unix/sysv/linux/hppa/libc.abilist
+index 5ae4bc610b..99131fc951 100644
+--- a/sysdeps/unix/sysv/linux/hppa/libc.abilist
++++ b/sysdeps/unix/sysv/linux/hppa/libc.abilist
+@@ -2822,60 +2822,61 @@ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 cacheflush F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/i386/libc.abilist b/sysdeps/unix/sysv/linux/i386/libc.abilist
+index 5ed513a623..65e812e313 100644
+--- a/sysdeps/unix/sysv/linux/i386/libc.abilist
++++ b/sysdeps/unix/sysv/linux/i386/libc.abilist
+@@ -3005,60 +3005,61 @@ GLIBC_2.4 sys_errlist D 0x210
+ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/loongarch/ilp32/libc.abilist b/sysdeps/unix/sysv/linux/loongarch/ilp32/libc.abilist
+index 4dc42fb90e..6d912484de 100644
+--- a/sysdeps/unix/sysv/linux/loongarch/ilp32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/loongarch/ilp32/libc.abilist
+@@ -2260,32 +2260,33 @@ GLIBC_2.44 wcstombs F
+ GLIBC_2.44 wcstoq F
+ GLIBC_2.44 wcstoul F
+ GLIBC_2.44 wcstoul_l F
+ GLIBC_2.44 wcstoull F
+ GLIBC_2.44 wcstoull_l F
+ GLIBC_2.44 wcstoumax F
+ GLIBC_2.44 wcstouq F
+ GLIBC_2.44 wcswcs F
+ GLIBC_2.44 wcswidth F
+ GLIBC_2.44 wcsxfrm F
+ GLIBC_2.44 wcsxfrm_l F
+ GLIBC_2.44 wctob F
+ GLIBC_2.44 wctomb F
+ GLIBC_2.44 wctrans F
+ GLIBC_2.44 wctrans_l F
+ GLIBC_2.44 wctype F
+ GLIBC_2.44 wctype_l F
+ GLIBC_2.44 wcwidth F
+ GLIBC_2.44 wmemchr F
+ GLIBC_2.44 wmemcmp F
+ GLIBC_2.44 wmemcpy F
+ GLIBC_2.44 wmemmove F
+ GLIBC_2.44 wmempcpy F
+ GLIBC_2.44 wmemset F
+ GLIBC_2.44 wordexp F
+ GLIBC_2.44 wordfree F
+ GLIBC_2.44 wprintf F
+ GLIBC_2.44 write F
+ GLIBC_2.44 writev F
+ GLIBC_2.44 wscanf F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist b/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
+index 1cf70f6cdf..b1db44e4a8 100644
+--- a/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/loongarch/lp64/libc.abilist
+@@ -2269,32 +2269,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist b/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
+index 4e4d4dbdfd..606e003739 100644
+--- a/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
++++ b/sysdeps/unix/sysv/linux/m68k/coldfire/libc.abilist
+@@ -2781,60 +2781,61 @@ GLIBC_2.4 xdrstdio_create F
+ GLIBC_2.4 xencrypt F
+ GLIBC_2.4 xprt_register F
+ GLIBC_2.4 xprt_unregister F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist b/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
+index 58e80df210..606d430be9 100644
+--- a/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
++++ b/sysdeps/unix/sysv/linux/m68k/m680x0/libc.abilist
+@@ -2948,60 +2948,61 @@ GLIBC_2.4 sys_errlist D 0x210
+ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist b/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
+index ee7bd65818..5037d8d2a5 100644
+--- a/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/microblaze/be/libc.abilist
+@@ -2834,32 +2834,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist b/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
+index 269c8e6315..a9e01dbde7 100644
+--- a/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/microblaze/le/libc.abilist
+@@ -2831,32 +2831,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
+index fc9609351e..cfd591214a 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips32/fpu/libc.abilist
+@@ -2911,60 +2911,61 @@ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
+index 9ab36b5e2d..0ffed6bb8f 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips32/nofpu/libc.abilist
+@@ -2909,60 +2909,61 @@ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
+index 9ead3c2c89..7e87b469ac 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips64/n32/libc.abilist
+@@ -2917,60 +2917,61 @@ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist b/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
+index 18a00bc9a6..f5d21eda3c 100644
+--- a/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/mips/mips64/n64/libc.abilist
+@@ -2819,60 +2819,61 @@ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/or1k/libc.abilist b/sysdeps/unix/sysv/linux/or1k/libc.abilist
+index 7c220c414c..d6d8e73bfb 100644
+--- a/sysdeps/unix/sysv/linux/or1k/libc.abilist
++++ b/sysdeps/unix/sysv/linux/or1k/libc.abilist
+@@ -2259,32 +2259,33 @@ GLIBC_2.40 getcontext F
+ GLIBC_2.40 makecontext F
+ GLIBC_2.40 setcontext F
+ GLIBC_2.40 swapcontext F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
+index 44fcc172a4..1318d60646 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc32/fpu/libc.abilist
+@@ -3138,60 +3138,61 @@ GLIBC_2.4 wcstold F
+ GLIBC_2.4 wcstold_l F
+ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 pthread_attr_setstack F
+ GLIBC_2.6 pthread_attr_setstacksize F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
+index 33b91a001c..5339d2d473 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc32/nofpu/libc.abilist
+@@ -3183,60 +3183,61 @@ GLIBC_2.4 wcstold F
+ GLIBC_2.4 wcstold_l F
+ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 pthread_attr_setstack F
+ GLIBC_2.6 pthread_attr_setstacksize F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
+index 638ea184d3..81246d5c06 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc64/be/libc.abilist
+@@ -2892,60 +2892,61 @@ GLIBC_2.4 wcstold F
+ GLIBC_2.4 wcstold_l F
+ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 pthread_attr_setstack F
+ GLIBC_2.6 pthread_attr_setstacksize F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+diff --git a/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist b/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
+index 66b2d73497..b481a1631f 100644
+--- a/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/powerpc/powerpc64/le/libc.abilist
+@@ -2968,32 +2968,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist b/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
+index 5d832d1304..ddc0a14b99 100644
+--- a/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/riscv/rv32/libc.abilist
+@@ -2512,32 +2512,33 @@ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.40 __riscv_hwprobe F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist b/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
+index ea97ab4f6a..4ec350e8db 100644
+--- a/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/riscv/rv64/libc.abilist
+@@ -2712,32 +2712,33 @@ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.40 __riscv_hwprobe F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+diff --git a/sysdeps/unix/sysv/linux/s390/libc.abilist b/sysdeps/unix/sysv/linux/s390/libc.abilist
+index 703c402f99..04ee46970a 100644
+--- a/sysdeps/unix/sysv/linux/s390/libc.abilist
++++ b/sysdeps/unix/sysv/linux/s390/libc.abilist
+@@ -2929,60 +2929,61 @@ GLIBC_2.4 wcstold F
+ GLIBC_2.4 wcstold_l F
+ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/sh/be/libc.abilist b/sysdeps/unix/sysv/linux/sh/be/libc.abilist
+index 47079e00ca..118af7bdef 100644
+--- a/sysdeps/unix/sysv/linux/sh/be/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sh/be/libc.abilist
+@@ -2828,60 +2828,61 @@ GLIBC_2.4 sys_errlist D 0x210
+ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/sh/le/libc.abilist b/sysdeps/unix/sysv/linux/sh/le/libc.abilist
+index 21677414a5..e56f341e2c 100644
+--- a/sysdeps/unix/sysv/linux/sh/le/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sh/le/libc.abilist
+@@ -2825,60 +2825,61 @@ GLIBC_2.4 sys_errlist D 0x210
+ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist b/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
+index 52515956fc..257c3f1967 100644
+--- a/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sparc/sparc32/libc.abilist
+@@ -3159,60 +3159,61 @@ GLIBC_2.4 wprintf F
+ GLIBC_2.4 wscanf F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist b/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
+index 2f2dc8a456..a83c88dd12 100644
+--- a/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/sparc/sparc64/libc.abilist
+@@ -2795,60 +2795,61 @@ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 tcgetattr F
+ GLIBC_2.42 tcsetattr F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist b/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
+index 286fe42a5b..3e74981dbf 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
++++ b/sysdeps/unix/sysv/linux/x86_64/64/libc.abilist
+@@ -2744,60 +2744,61 @@ GLIBC_2.4 sys_errlist D 0x420
+ GLIBC_2.4 sys_nerr D 0x4
+ GLIBC_2.4 unlinkat F
+ GLIBC_2.4 unshare F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+ GLIBC_2.5 __readlinkat_chk F
+ GLIBC_2.5 inet6_opt_append F
+ GLIBC_2.5 inet6_opt_find F
+ GLIBC_2.5 inet6_opt_finish F
+ GLIBC_2.5 inet6_opt_get_val F
+ GLIBC_2.5 inet6_opt_init F
+ GLIBC_2.5 inet6_opt_next F
+ GLIBC_2.5 inet6_opt_set_val F
+ GLIBC_2.5 inet6_rth_add F
+ GLIBC_2.5 inet6_rth_getaddr F
+ GLIBC_2.5 inet6_rth_init F
+ GLIBC_2.5 inet6_rth_reverse F
+ GLIBC_2.5 inet6_rth_segments F
+ GLIBC_2.5 inet6_rth_space F
+ GLIBC_2.5 splice F
+ GLIBC_2.5 tee F
+ GLIBC_2.5 vmsplice F
+ GLIBC_2.6 __sched_cpucount F
+ GLIBC_2.6 epoll_pwait F
+ GLIBC_2.6 futimens F
+ GLIBC_2.6 sched_getcpu F
+ GLIBC_2.6 strerror_l F
+ GLIBC_2.6 sync_file_range F
+ GLIBC_2.6 utimensat F
+ GLIBC_2.7 __fread_chk F
+ GLIBC_2.7 __fread_unlocked_chk F
+ GLIBC_2.7 __isoc99_fscanf F
+ GLIBC_2.7 __isoc99_fwscanf F
+diff --git a/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist b/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
+index b6f3ea7d2d..bc929788c8 100644
+--- a/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
++++ b/sysdeps/unix/sysv/linux/x86_64/x32/libc.abilist
+@@ -2763,32 +2763,33 @@ GLIBC_2.39 stdc_trailing_zeros_ui F
+ GLIBC_2.39 stdc_trailing_zeros_ul F
+ GLIBC_2.39 stdc_trailing_zeros_ull F
+ GLIBC_2.39 stdc_trailing_zeros_us F
+ GLIBC_2.41 sched_getattr F
+ GLIBC_2.41 sched_setattr F
+ GLIBC_2.42 __inet_ntop_chk F
+ GLIBC_2.42 __inet_pton_chk F
+ GLIBC_2.42 cfgetibaud F
+ GLIBC_2.42 cfgetispeed F
+ GLIBC_2.42 cfgetobaud F
+ GLIBC_2.42 cfgetospeed F
+ GLIBC_2.42 cfsetbaud F
+ GLIBC_2.42 cfsetibaud F
+ GLIBC_2.42 cfsetispeed F
+ GLIBC_2.42 cfsetobaud F
+ GLIBC_2.42 cfsetospeed F
+ GLIBC_2.42 cfsetspeed F
+ GLIBC_2.42 pthread_gettid_np F
+ GLIBC_2.42 uabs F
+ GLIBC_2.42 uimaxabs F
+ GLIBC_2.42 ulabs F
+ GLIBC_2.42 ullabs F
+ GLIBC_2.43 __memset_explicit_chk F
+ GLIBC_2.43 free_aligned_sized F
+ GLIBC_2.43 free_sized F
+ GLIBC_2.43 memalignment F
+ GLIBC_2.43 memset_explicit F
+ GLIBC_2.43 mseal F
+ GLIBC_2.43 openat2 F
+ GLIBC_2.43 umaxabs F
++GLIBC_2.45 dl_events_subscribe F
+ GLIBC_2.45 posix_spawn_file_actions_addchdir F
+ GLIBC_2.45 posix_spawn_file_actions_addfchdir F
+-- 
+2.55.0
+
