@@ -7,14 +7,16 @@
 # The build itself downloads nothing. binutils and glibc (on top of the
 # kernel headers) don't depend on each other, so they are separate stages
 # (BuildKit builds them in parallel); gcc is then built once, on top of
-# both. See NOTES for why that is enough here.
+# both. See README for why that is enough here.
 
 ARG BINUTILS_VERSION=2.47
 ARG LINUX_VERSION=6.18.56
 ARG GLIBC_COMMIT=b84c6a67f25ff501e6e833502937159f36d32d4f
 ARG GCC_VERSION=16.2.0
 
-FROM ubuntu:latest AS base
+# Debian stable, so the toolchain's own binaries (gcc, as, ld, ...) only need
+# glibc 2.41 and can be copied out to most current distros (see README).
+FROM debian:trixie AS base
 
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -22,7 +24,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # The vendor field ("glibc") only matters in that it makes TARGET differ
-# from the build triple, so gcc is built as a cross compiler (see NOTES).
+# from the build triple, so gcc is built as a cross compiler (see README).
 ENV PREFIX=/opt/glibc-gcc \
     TARGET=x86_64-glibc-linux-gnu \
     TOOLDIR=/opt/glibc-gcc/x86_64-glibc-linux-gnu \
@@ -50,7 +52,7 @@ ADD sources/linux-$LINUX_VERSION.tar.xz .
 RUN make -C linux-$LINUX_VERSION ARCH=x86_64 INSTALL_HDR_PATH=$TOOLDIR headers_install
 
 # --- glibc ---
-# Built with Ubuntu's gcc and binutils. Installed straight into gcc's
+# Built with Debian's gcc and binutils. Installed straight into gcc's
 # tooldir, where it looks for target headers, crt files and libs by default.
 # With a prefix other than /usr glibc puts everything (including ld.so) into
 # $TOOLDIR/lib. lib64 is made a symlink to it so that gcc's libstdc++ and
@@ -64,8 +66,8 @@ COPY patches/*.patch patches/
 RUN cd glibc-$GLIBC_COMMIT && \
     for p in ../patches/*.patch; do patch -p1 < $p || exit 1; done
 # --host makes it a cross build: no ldconfig run and no install test (which
-# would use Ubuntu's gcc) at make install. Time zone data and the local time
-# zone come from the host (glibc doesn't ship tzdata), see NOTES.
+# would use Debian's gcc) at make install. Time zone data and the local time
+# zone come from the host (glibc doesn't ship tzdata), see README.
 RUN mkdir obj && cd obj && \
     printf '%s\n' 'zonedir = /usr/share/zoneinfo' 'localtime-file = /etc/localtime' > configparms && \
     ../glibc-$GLIBC_COMMIT/configure \
@@ -88,7 +90,7 @@ COPY --from=glibc /opt/glibc-gcc /opt/glibc-gcc
 
 # gcc (without a sysroot) inspects the target headers in sys-include: to
 # detect the glibc version, to decide whether its limits.h chains to
-# glibc's, and to run fixincludes. See NOTES.
+# glibc's, and to run fixincludes. See README.
 RUN ln -s include $TOOLDIR/sys-include
 
 # gmp/mpfr/mpc/isl/gettext are built in-tree, so there are no host lib deps.
@@ -127,7 +129,7 @@ RUN $TARGET-g++ -O2 -static -o /tmp/t-static /tmp/t.cc && \
     /tmp/t-dynamic
 
 
-FROM ubuntu:latest
+FROM debian:trixie
 
 COPY --from=gcc /opt/glibc-gcc /opt/glibc-gcc
 ENV PATH=/opt/glibc-gcc/bin:$PATH

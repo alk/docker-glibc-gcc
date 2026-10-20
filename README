@@ -1,0 +1,321 @@
+glibc-gcc: a self-contained x86_64 glibc + gcc toolchain
+=========================================================
+
+A Dockerfile that builds a C/C++ toolchain into /opt/glibc-gcc:
+
+- gcc 16.2 (C, C++), binutils 2.47, Linux 6.18 kernel headers,
+- glibc from git master with the patches in patches/ applied,
+
+where everything, including the dynamic loader that compiled programs use,
+lives under /opt/glibc-gcc. Programs built with it don't touch the system's
+/lib, /usr/lib or /usr/include at all, neither at build time nor at run
+time. So it is a convenient way to build and run code against a patched or
+unreleased glibc without replacing the system one.
+
+The patches are the _dl_find_object fixes and the dl_events_subscribe
+prototype from https://github.com/alk/dl-find-object (doc/glibc/). See
+https://tinyurl.com/dl-events-subscribe-design for the API design.
+
+
+Building
+--------
+
+    ./fetch-sources.sh          # snapshots all sources into sources/
+    docker build -t glibc-gcc .
+
+fetch-sources.sh needs wcurl (from curl) and git. The docker build itself
+downloads nothing but the Debian base image and packages. It takes about
+10 minutes on 32 cores and needs ~15 GB of free space in the docker storage
+while building. The resulting image is ~2.3 GB; /opt/glibc-gcc in it is
+~2.1 GB, most of that debug info in glibc's and gcc's libraries.
+
+The image ends with a smoke test (smoke-test.cc): a C++ program with a
+thread that calls dl_events_subscribe, built both -static and dynamic and
+run. For the dynamic one it checks that the loader and every library come
+from /opt/glibc-gcc.
+
+
+Using it
+--------
+
+Inside the image /opt/glibc-gcc/bin is on PATH:
+
+    docker run --rm -it -v $PWD:/src -w /src glibc-gcc
+    x86_64-glibc-linux-gnu-g++ -O2 -o hello hello.cc
+    ./hello
+
+Tools are prefixed with the target triple: x86_64-glibc-linux-gnu-gcc,
+-g++, -ld, -objdump, -readelf, etc. glibc's own programs (ldd, iconv,
+locale, localedef, getconf, ...) are in /opt/glibc-gcc/x86_64-glibc-linux-gnu/bin,
+ldconfig and friends in .../sbin.
+
+Programs built with it need /opt/glibc-gcc at run time (the loader path is
+hardcoded, see below) unless linked with -static.
+
+Existing binaries, built against the system glibc, can also be run on the
+patched glibc via its loader, as long as the system glibc is not newer:
+
+    /opt/glibc-gcc/x86_64-glibc-linux-gnu/lib/ld-linux-x86-64.so.2 ./prog
+
+or linked to use it directly with
+-Wl,--dynamic-linker=/opt/glibc-gcc/x86_64-glibc-linux-gnu/lib/ld-linux-x86-64.so.2.
+
+
+Copying the toolchain out of the image
+--------------------------------------
+
+The image is built on Debian stable (trixie, glibc 2.41), so the
+toolchain's own executables (gcc, cc1plus, as, ld, ...) run on any
+reasonably current x86_64 Linux distro: they need nothing from the host but
+libc.so.6 and libm.so.6, and currently only use symbols up to GLIBC_2.38.
+libstdc++ and gcc's support libraries (gmp, mpfr, mpc, isl) are linked in
+statically.
+
+To install it on the host, copy /opt/glibc-gcc to the same path:
+
+    docker create --name glibc-gcc-copy glibc-gcc
+    docker cp glibc-gcc-copy:/opt/glibc-gcc - | sudo tar -C /opt -x
+    docker rm glibc-gcc-copy
+    export PATH=/opt/glibc-gcc/bin:$PATH
+
+docker cp writes a tar stream to stdout here, so only tar needs root, and
+it works with a remote docker host too. To take it to another machine,
+save that stream to a file instead (docker cp ... - | xz > glibc-gcc.tar.xz)
+and unpack it with tar -C /opt -xf there.
+
+It has to end up at /opt/glibc-gcc exactly: compiled programs get
+/opt/glibc-gcc/... as their loader, ld.so has its search path compiled in,
+and glibc's linker scripts (libc.so, and even libm.a) refer to libraries
+by absolute path, so not even -static links work elsewhere. (The gcc
+driver itself is relocatable, but that doesn't help much.)
+Building it for a different path means changing PREFIX in the Dockerfile.
+
+
+Build steps
+===========
+
+The textbook cross-toolchain recipe builds binutils, a stage 1 (C-only)
+gcc, then the libc, then the full gcc, all against a sysroot. For this
+particular toolchain (x86_64 host, x86_64 glibc target, fixed install path
+/opt/glibc-gcc) most of that isn't needed, so the Dockerfile does less:
+
+- binutils: built (see below why).
+- kernel headers, then glibc: glibc is built with Debian's gcc and
+  binutils, both are installed straight into gcc's "tooldir"
+  (/opt/glibc-gcc/x86_64-glibc-linux-gnu, $TOOLDIR in the Dockerfile).
+  No stage 1 gcc.
+- gcc: built once, C and C++, no sysroot.
+
+binutils and glibc don't depend on each other, so they are separate Docker
+stages that get built in parallel (the kernel headers stage feeds glibc).
+The gcc stage copies binutils and glibc in.
+
+Sources come from sources/ (see fetch-sources.sh), not the network. All
+versions are ARGs at the top of the Dockerfile; fetch-sources.sh reads them
+from there and only fetches what is missing.
+
+gcc's in-tree prerequisites (gmp, mpfr, mpc, isl, gettext) are fetched at
+the versions that gcc release pins in contrib/download_prerequisites. In
+the docker build, download_prerequisites then finds them already present,
+checks their sha512 sums, unpacks them and adds the symlinks, so gcc has no
+host library dependencies.
+
+
+glibc version and patches
+-------------------------
+
+The patches are against glibc master (version 2.44.9000;
+dl_events_subscribe is a GLIBC_2.45 symbol), not a release, so glibc is the
+git snapshot GLIBC_COMMIT. sourceware doesn't serve snapshot tarballs, but
+it does allow fetching a single commit, so fetch-sources.sh does a shallow
+fetch of that commit and turns it into a tarball with git archive (plus
+gzip -n, which gives the same bytes every time).
+
+To move to newer patches: put them into patches/, set GLIBC_COMMIT to the
+commit they are based on (git format-patch --base=... records it), and rerun
+fetch-sources.sh.
+
+
+The target triple
+-----------------
+
+gcc decides whether it's a cross compiler by comparing the canonical build
+and target triples. x86_64-linux-gnu canonicalizes to x86_64-pc-linux-gnu,
+which is exactly what config.guess says for the build machine, so gcc would
+be built native and search /usr/include, /lib, /usr/lib, ... and Debian's
+multiarch dirs. A different vendor field (x86_64-glibc-linux-gnu) changes
+nothing about the generated code, but makes it a cross compiler that only
+looks in /opt/glibc-gcc (see "No sysroot").
+
+glibc gets the same triple as --host, so its build is a cross build too.
+That mostly matters for make install: in a native build it runs ldconfig
+and scripts/test-installation.pl, which compiles test programs with $CC
+(Debian's gcc, linking against Debian's libc).
+
+
+Building our own binutils
+-------------------------
+
+Not strictly needed. Host and target are both x86_64 ELF, so the assembler
+and linker don't care which libc they produce code for; everything
+libc-specific (crt files, loader path, search paths) comes from the gcc
+driver. gcc could be configured with --with-as=/usr/bin/as
+--with-ld=/usr/bin/ld (or symlinks in $TOOLDIR/bin).
+
+Why build it anyway:
+- Debian's ld has the multiarch dirs (/usr/lib/x86_64-linux-gnu etc.)
+  built in as default search dirs, so a -lfoo that our dirs don't have
+  would silently pick up the system one. Ours only searches the tooldir
+  (x86_64-glibc-linux-gnu-ld --verbose | grep SEARCH_DIR).
+- /opt/glibc-gcc is self-contained and doesn't change behavior when the
+  host's binutils is upgraded or copied to another distro.
+- gcc's configure probes as/ld features and bakes the results in, so
+  binutils should be at least as new as gcc and should not change
+  afterwards.
+- We get the full x86_64-glibc-linux-gnu-{ar,nm,objcopy,readelf,strip,...}
+  set, and a linker we can rebuild or patch for dynamic linker experiments.
+- It's cheap (about a minute) and runs in parallel with the glibc build.
+
+
+No stage 1 gcc
+--------------
+
+glibc only needs a C compiler and binutils that produce x86_64 code: it
+builds with -nostdlib/-nostdinc where it matters and links libgcc.a from
+the compiler it's built with. Debian's gcc and binutils are new enough
+(glibc wants gcc >= 12.1, binutils >= 2.39), and glibc's configure deals
+with distro hardening defaults (stack protector, PIE, CET, fortify).
+gcc then only needs *an* installed glibc (headers, crt files, libc.so) to
+build libgcc_s and libstdc++ against, not one built by a stage 1 gcc.
+--disable-werror because master plus a gcc newer than what glibc was last
+tested with tends to produce new warnings.
+
+Stage 1 is required for real cross targets (aarch64, riscv, ...), which is
+why the textbook recipes include it. What we give up is glibc being built
+by the same gcc version the toolchain ships. If that ever matters, the next
+simplest option is to configure gcc once, `make all-gcc`, build glibc with
+the gcc from the build tree, then finish the same gcc build.
+
+
+No sysroot
+----------
+
+Since x86_64-glibc-linux-gnu isn't the build triple, gcc is a cross
+compiler, and without a sysroot it never looks at the host's /usr/include,
+/lib or /usr/lib. It uses the tooldir ($PREFIX/$TARGET): headers in include
+(and sys-include), crt files and libs in lib (and lib/../lib64); our ld
+defaults there too. So glibc is configured with --prefix=$TOOLDIR and
+installed without DESTDIR, and the kernel headers go to
+INSTALL_HDR_PATH=$TOOLDIR.
+
+glibc's libc.so is a linker script with absolute paths
+($TOOLDIR/lib/libc.so.6 etc.). Without a sysroot ld uses them as is, which
+is right since glibc is installed at its final location.
+
+What a sysroot would buy, if we ever want it:
+- A tree shaped like a real root filesystem (usr/include, usr/lib, lib), so
+  other libraries can be cross-built with the usual --prefix=/usr
+  DESTDIR=$SYSROOT and picked up automatically (also by pkg-config via
+  PKG_CONFIG_SYSROOT_DIR). Without one, build them with --prefix=$TOOLDIR.
+- ld resolves absolute paths in linker scripts (like libc.so) and -L=
+  paths under it.
+- It's the modern convention (crosstool-ng, buildroot, Yocto).
+- gcc can be moved elsewhere: a sysroot under the prefix is found relative
+  to the gcc binary. Not something we need, since the loader path is
+  hardcoded to /opt/glibc-gcc anyway.
+
+What it costs: binutils and gcc need --with-sysroot, and gcc also
+--with-build-sysroot (the xgcc in the gcc build tree computes the
+relocatable sysroot relative to its own location, so building libgcc fails
+with "stdio.h: No such file or directory" without it). glibc needs
+DESTDIR=$SYSROOT and --prefix=/usr, and its libs end up spread over lib64
+and usr/lib64.
+
+
+sys-include and gcc's limits.h
+------------------------------
+
+For a cross gcc without a sysroot, gcc's configure and build look at the
+target headers in $TOOLDIR/sys-include (not include):
+
+- configure reads features.h there to learn the glibc version, which turns
+  on things like TARGET_LIBC_PROVIDES_SSP and gnu_unique_object;
+- LIMITS_H_TEST (gcc/Makefile.in) decides whether gcc's own limits.h
+  #include_next's the libc's one. If not, <limits.h> lacks PATH_MAX and
+  friends;
+- fixincludes processes the headers found there.
+
+So the gcc stage makes $TOOLDIR/sys-include a symlink to include before
+building gcc. gcc drops the duplicate directory from the include path (it
+compares inodes). The smoke test prints PATH_MAX.
+
+(musl based toolchains get away without this: for *-musl targets gcc's
+linux.h puts the libc headers before gcc's own include dir, so musl's
+limits.h is found first, and fixincludes is skipped.)
+
+
+Directory layout
+----------------
+
+With a prefix other than /usr, glibc puts both slibdir and rtlddir in
+$prefix/lib (only --prefix=/usr gets /lib64 on x86_64). So ld.so is
+$TOOLDIR/lib/ld-linux-x86-64.so.2 and libc.so.6 and friends are next to it.
+ld.so's built-in search path (used after LD_LIBRARY_PATH, rpath and
+ld.so.cache) is that same directory.
+
+gcc installs libstdc++ and libgcc_s into $TOOLDIR/lib/../lib64 (the x86_64
+multilib OS dir, even with --disable-multilib). $TOOLDIR/lib64 is a symlink
+to lib, so they end up next to libc and ld.so finds them without rpath and
+without an ld.so.cache. (The alternative is $TOOLDIR/etc/ld.so.conf listing
+lib64, plus rerunning ldconfig after every change to the dirs.) Our ld
+searches $TOOLDIR/lib64 and $TOOLDIR/lib by default, which is now the same
+directory twice; harmless.
+
+glibc's make install also puts its programs into $TOOLDIR/bin, next to
+binutils' unprefixed as/ld/... (which gcc runs), and ldconfig, zic etc.
+into $TOOLDIR/sbin. None of the names clash. ldd is a script that runs our
+ld.so on the binary.
+
+
+Dynamic loader at /opt/glibc-gcc
+--------------------------------
+
+- gcc, not glibc, hardcodes the loader path (PT_INTERP) written into
+  executables: GLIBC_DYNAMIC_LINKER64 in gcc/config/i386/linux64.h. The
+  Dockerfile seds it to $TOOLDIR/lib/ld-linux-x86-64.so.2.
+- ld.so finds libs in its own directory (see "Directory layout").
+- $TOOLDIR/etc/ld.so.cache doesn't exist (cross builds don't run
+  ldconfig). If you add $TOOLDIR/etc/ld.so.conf, run $TOOLDIR/sbin/ldconfig
+  after changes.
+- The tooldir only matters at compile and link time. At run time only
+  absolute paths count.
+
+
+Runtime files from the host
+---------------------------
+
+glibc derives some runtime paths from the configured prefix and hardcodes
+others:
+
+- Under $TOOLDIR: ld.so.cache, gconv modules (lib/gconv), compiled locales
+  (lib/locale, empty: C and C.UTF-8 are built in; build others with our
+  localedef, or point LOCPATH elsewhere).
+- Host /etc, hardcoded: nsswitch.conf, resolv.conf, hosts, gai.conf, and
+  ld.so.preload (so the host's preload file, if any, applies). NSS modules
+  named in the host's nsswitch.conf that we don't have (systemd, mdns,
+  ...) are skipped.
+- Time zones: glibc ships no tzdata, and by default would look for it in
+  $TOOLDIR/share/zoneinfo and for the local zone in $TOOLDIR/etc/localtime,
+  so everything would be UTC. The glibc stage's configparms points zonedir
+  and localtime-file at /usr/share/zoneinfo and /etc/localtime instead.
+
+
+gcc configure flags
+-------------------
+
+--disable-bootstrap: the host gcc is recent, and a 3-stage bootstrap would
+triple the build time for nothing we need. --disable-multilib: no 32-bit
+or x32 runtimes. libsanitizer stays enabled (-fsanitize=address etc. work).
+
+The gcc stage deletes its source and build trees in the same RUN as make
+install. Otherwise that layer is ~8 GB.

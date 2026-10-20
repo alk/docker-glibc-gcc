@@ -16,7 +16,7 @@ int main() {
     return 1;
   }
   // PATH_MAX comes from glibc's limits.h, which gcc's limits.h only pulls in
-  // when gcc was built seeing glibc's headers (see NOTES).
+  // when gcc was built seeing glibc's headers (see README).
   std::thread t([] {
     std::printf("hello from glibc c++, PATH_MAX=%d, %d modules loaded\n", PATH_MAX, loaded);
   });
